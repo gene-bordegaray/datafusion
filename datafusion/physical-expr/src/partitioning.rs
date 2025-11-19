@@ -425,23 +425,23 @@ mod tests {
         let eq_properties = EquivalenceProperties::new(schema);
 
         // Case 1: Hash([a]) should NOT satisfy Hash([a, b])
-        let hash_a = Partitioning::Hash(vec![col_a.clone()], 4);
+        let hash_a = Partitioning::Hash(vec![Arc::clone(&col_a)], 4);
         let required_ab =
-            Distribution::HashPartitioned(vec![col_a.clone(), col_b.clone()]);
+            Distribution::HashPartitioned(vec![Arc::clone(&col_a), Arc::clone(&col_b)]);
         assert!(
             !hash_a.satisfy(&required_ab, &eq_properties),
             "Hash([a]) should NOT satisfy Hash([a,b]) - subset matching not safe for hash partitioning"
         );
 
         // Case 2: Hash([a]) SHOULD satisfy Hash([a])
-        let required_a = Distribution::HashPartitioned(vec![col_a.clone()]);
+        let required_a = Distribution::HashPartitioned(vec![Arc::clone(&col_a)]);
         assert!(
             hash_a.satisfy(&required_a, &eq_properties),
             "Hash([a]) should satisfy Hash([a]) - exact match"
         );
 
         // Case 3: Hash([a, b]) should satisfy Hash([a, b])
-        let hash_ab = Partitioning::Hash(vec![col_a.clone(), col_b.clone()], 4);
+        let hash_ab = Partitioning::Hash(vec![Arc::clone(&col_a), Arc::clone(&col_b)], 4);
         assert!(
             hash_ab.satisfy(&required_ab, &eq_properties),
             "Hash([a,b]) should satisfy Hash([a,b]) - exact match"
@@ -454,7 +454,7 @@ mod tests {
         );
 
         // Case 5: SingleValuePartitioned([a]) should satisfy Hash([a, b])
-        let single_a = Partitioning::SingleValuePartitioned(vec![col_a.clone()], 4);
+        let single_a = Partitioning::SingleValuePartitioned(vec![Arc::clone(&col_a)], 4);
         assert!(
             single_a.satisfy(&required_ab, &eq_properties),
             "SingleValuePartitioned([a]) should satisfy Hash([a,b]) - subset matching is safe"
@@ -462,9 +462,9 @@ mod tests {
 
         // Case 6: SingleValuePartitioned([a]) should satisfy Hash([a, b, c])
         let required_abc = Distribution::HashPartitioned(vec![
-            col_a.clone(),
-            col_b.clone(),
-            col_c.clone(),
+            Arc::clone(&col_a),
+            Arc::clone(&col_b),
+            Arc::clone(&col_c),
         ]);
         assert!(
             single_a.satisfy(&required_abc, &eq_properties),
@@ -472,8 +472,10 @@ mod tests {
         );
 
         // Case 7: SingleValuePartitioned([a, b]) should satisfy Hash([a, b])
-        let single_ab =
-            Partitioning::SingleValuePartitioned(vec![col_a.clone(), col_b.clone()], 4);
+        let single_ab = Partitioning::SingleValuePartitioned(
+            vec![Arc::clone(&col_a), Arc::clone(&col_b)],
+            4,
+        );
         assert!(
             single_ab.satisfy(&required_ab, &eq_properties),
             "SingleValuePartitioned([a,b]) should satisfy Hash([a,b]) - exact match"
@@ -486,15 +488,17 @@ mod tests {
         );
 
         // Case 9: SingleValuePartitioned([a, c]) should satisfy Hash([a, b, c])
-        let single_ac =
-            Partitioning::SingleValuePartitioned(vec![col_a.clone(), col_c.clone()], 4);
+        let single_ac = Partitioning::SingleValuePartitioned(
+            vec![Arc::clone(&col_a), Arc::clone(&col_c)],
+            4,
+        );
         assert!(
             single_ac.satisfy(&required_abc, &eq_properties),
             "SingleValuePartitioned([a,c]) should satisfy Hash([a,b,c]) - subset match"
         );
 
         // Case 10: SingleValuePartitioned([a, c]) should NOT satisfy Hash([b])
-        let required_b = Distribution::HashPartitioned(vec![col_b.clone()]);
+        let required_b = Distribution::HashPartitioned(vec![Arc::clone(&col_b)]);
         assert!(
             !single_ac.satisfy(&required_b, &eq_properties),
             "SingleValuePartitioned([a,c]) should NOT satisfy Hash([b]) - no common columns"

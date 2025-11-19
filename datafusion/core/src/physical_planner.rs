@@ -815,7 +815,7 @@ impl DefaultPhysicalPlanner {
                     && initial_aggr.input().output_partitioning().partition_count() > 1
                     && initial_aggr.input().output_partitioning().satisfy(
                         &Distribution::HashPartitioned(groups.input_exprs()),
-                        &initial_aggr.input().equivalence_properties(),
+                        initial_aggr.input().equivalence_properties(),
                     );
 
                 let next_partition_mode = if can_repartition || input_already_partitioned
