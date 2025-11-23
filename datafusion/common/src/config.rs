@@ -468,6 +468,13 @@ config_namespace! {
     ///
     /// [`SessionConfig`]: https://docs.rs/datafusion/latest/datafusion/prelude/struct.SessionConfig.html
     pub struct ExecutionOptions {
+        /// When set to true, `ListingTable` will attempt to group files into partitions
+        /// that respect the hive-style partitioning boundaries.
+        /// This enables parallel aggregation optimization.
+        ///
+        /// Defaults to true
+        pub listing_table_preserve_partition_values: bool, default = true
+
         /// Default batch size while creating new batches, it's especially useful for
         /// buffer-in-memory batches since creating tiny batches would result in too much
         /// metadata memory consumption

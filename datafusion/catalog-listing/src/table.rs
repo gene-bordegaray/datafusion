@@ -24,7 +24,7 @@ use datafusion_catalog::{ScanArgs, ScanResult, Session, TableProvider};
 use datafusion_common::stats::Precision;
 use datafusion_common::{
     internal_datafusion_err, plan_err, project_schema, Constraints, DataFusionError,
-    SchemaExt, Statistics,
+    ScalarValue, SchemaExt, Statistics,
 };
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
@@ -42,6 +42,8 @@ use datafusion_expr::dml::InsertOp;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion_physical_expr::create_lex_ordering;
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::{Partitioning, PhysicalExpr};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use datafusion_physical_plan::empty::EmptyExec;
@@ -495,21 +497,54 @@ impl TableProvider for ListingTable {
         let file_source = self.create_file_source_with_schema_adapter()?;
 
         // create the execution plan
+        let partition_count = partitioned_file_lists.len();
+        let mut builder = FileScanConfigBuilder::new(object_store_url, file_source)
+            .with_file_groups(partitioned_file_lists)
+            .with_constraints(self.constraints.clone())
+            .with_statistics(statistics)
+            .with_projection_indices(projection.clone())
+            .with_limit(limit)
+            .with_output_ordering(output_ordering)
+            .with_expr_adapter(self.expr_adapter_factory.clone());
+
+        if self.options.preserve_partition_values {
+            let partition_exprs = self
+                .options
+                .table_partition_cols
+                .iter()
+                .map(|(name, _)| {
+                    // If the partition column is projected out, we can't use it for partitioning
+                    // We need to find its index in the output schema of the scan
+                    if let Some(proj) = &projection {
+                        let schema_index = self.table_schema.index_of(name).unwrap();
+                        if let Some(new_index) =
+                            proj.iter().position(|&i| i == schema_index)
+                        {
+                            Some(Arc::new(Column::new(name, new_index))
+                                as Arc<dyn PhysicalExpr>)
+                        } else {
+                            None
+                        }
+                    } else {
+                        // If no projection, indices map 1:1 to table schema
+                        let index = self.table_schema.index_of(name).unwrap();
+                        Some(Arc::new(Column::new(name, index)) as Arc<dyn PhysicalExpr>)
+                    }
+                })
+                .collect::<Option<Vec<_>>>();
+
+            if let Some(partition_exprs) = partition_exprs {
+                builder = builder.with_output_partitioning(Partitioning::KeyPartitioned(
+                    partition_exprs,
+                    partition_count,
+                ));
+            }
+        }
+
         let plan = self
             .options
             .format
-            .create_physical_plan(
-                state,
-                FileScanConfigBuilder::new(object_store_url, file_source)
-                    .with_file_groups(partitioned_file_lists)
-                    .with_constraints(self.constraints.clone())
-                    .with_statistics(statistics)
-                    .with_projection_indices(projection)
-                    .with_limit(limit)
-                    .with_output_ordering(output_ordering)
-                    .with_expr_adapter(self.expr_adapter_factory.clone())
-                    .build(),
-            )
+            .create_physical_plan(state, builder.build())
             .await?;
 
         Ok(ScanResult::new(plan))
@@ -653,7 +688,14 @@ impl ListingTable {
         let (file_group, inexact_stats) =
             get_files_with_limit(files, limit, self.options.collect_stat).await?;
 
-        let file_groups = file_group.split_files(self.options.target_partitions);
+        let file_groups = if self.options.preserve_partition_values {
+            split_files_preserving_partitioning(
+                file_group,
+                self.options.target_partitions,
+            )
+        } else {
+            file_group.split_files(self.options.target_partitions)
+        };
         let (mut file_groups, mut stats) = compute_all_files_statistics(
             file_groups,
             self.schema(),
@@ -789,4 +831,41 @@ async fn get_files_with_limit(
     // files in a different order.
     let inexact_stats = all_files.next().await.is_some();
     Ok((file_group, inexact_stats))
+}
+
+/// Splits files into at most `n` groups, ensuring that files with the same partition values
+/// are always in the same group.
+fn split_files_preserving_partitioning(
+    file_group: FileGroup,
+    n: usize,
+) -> Vec<FileGroup> {
+    if file_group.is_empty() {
+        return vec![];
+    }
+    let files = file_group.into_inner();
+    let mut partition_map: HashMap<Vec<ScalarValue>, Vec<PartitionedFile>> =
+        HashMap::new();
+    for file in files {
+        partition_map
+            .entry(file.partition_values.clone())
+            .or_default()
+            .push(file);
+    }
+
+    let mut new_groups = vec![Vec::new(); n];
+    // Collect keys to sort them for determinism
+    let mut keys: Vec<_> = partition_map.keys().cloned().collect();
+    keys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    for (i, key) in keys.into_iter().enumerate() {
+        if let Some(files) = partition_map.remove(&key) {
+            new_groups[i % n].extend(files);
+        }
+    }
+
+    new_groups
+        .into_iter()
+        .map(FileGroup::new)
+        .filter(|g| !g.is_empty())
+        .collect()
 }

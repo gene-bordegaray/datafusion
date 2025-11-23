@@ -117,6 +117,14 @@ pub enum Partitioning {
     /// Allocate rows based on a hash of one of more expressions and the specified number of
     /// partitions
     Hash(Vec<Arc<dyn PhysicalExpr>>, usize),
+    /// Allocate rows based on a set of expressions and the specified number of
+    /// partitions. The partition keys are guaranteed to be disjoint across partitions,
+    /// meaning that a given unique key tuple will only appear in at most one partition.
+    ///
+    /// This is different from `Hash` partitioning which also guarantees that a key is in
+    /// one partition, but `Hash` implies a specific hash distribution (modulo N) which
+    /// is not guaranteed by `KeyPartitioned`.
+    KeyPartitioned(Vec<Arc<dyn PhysicalExpr>>, usize),
     /// Unknown partitioning scheme with a known number of partitions
     UnknownPartitioning(usize),
 }
@@ -133,6 +141,14 @@ impl Display for Partitioning {
                     .join(", ");
                 write!(f, "Hash([{phy_exprs_str}], {size})")
             }
+            Partitioning::KeyPartitioned(phy_exprs, size) => {
+                let phy_exprs_str = phy_exprs
+                    .iter()
+                    .map(|e| format!("{e}"))
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                write!(f, "KeyPartitioned([{phy_exprs_str}], {size})")
+            }
             Partitioning::UnknownPartitioning(size) => {
                 write!(f, "UnknownPartitioning({size})")
             }
@@ -144,7 +160,10 @@ impl Partitioning {
     pub fn partition_count(&self) -> usize {
         use Partitioning::*;
         match self {
-            RoundRobinBatch(n) | Hash(_, n) | UnknownPartitioning(n) => *n,
+            RoundRobinBatch(n)
+            | Hash(_, n)
+            | KeyPartitioned(_, n)
+            | UnknownPartitioning(n) => *n,
         }
     }
 
@@ -162,6 +181,32 @@ impl Partitioning {
             Distribution::HashPartitioned(_) if self.partition_count() == 1 => true,
             Distribution::HashPartitioned(required_exprs) => {
                 match self {
+                    Partitioning::KeyPartitioned(partition_exprs, _) => {
+                        let eq_groups = eq_properties.eq_group();
+                        let (normalized_required, normalized_partition) =
+                            if !eq_groups.is_empty() {
+                                (
+                                    required_exprs
+                                        .iter()
+                                        .map(|e| eq_groups.normalize_expr(Arc::clone(e)))
+                                        .collect::<Vec<_>>(),
+                                    partition_exprs
+                                        .iter()
+                                        .map(|e| eq_groups.normalize_expr(Arc::clone(e)))
+                                        .collect::<Vec<_>>(),
+                                )
+                            } else {
+                                (required_exprs.clone(), partition_exprs.clone())
+                            };
+
+                        // For KeyPartitioned, it satisfies the requirement if the partition keys
+                        // are a subset of the required keys.
+                        // E.g. if partitioned by (A), all rows with same A are together.
+                        // This implies all rows with same (A, B) are also together.
+                        normalized_partition
+                            .iter()
+                            .all(|p| normalized_required.iter().any(|r| p.eq(r)))
+                    }
                     // Here we do not check the partition count for hash partitioning and assumes the partition count
                     // and hash functions in the system are the same. In future if we plan to support storage partition-wise joins,
                     // then we need to have the partition count and hash functions validation.
@@ -202,19 +247,25 @@ impl Partitioning {
         mapping: &ProjectionMapping,
         input_eq_properties: &EquivalenceProperties,
     ) -> Self {
-        if let Partitioning::Hash(exprs, part) = self {
-            let normalized_exprs = input_eq_properties
-                .project_expressions(exprs, mapping)
-                .zip(exprs)
-                .map(|(proj_expr, expr)| {
-                    proj_expr.unwrap_or_else(|| {
-                        Arc::new(UnKnownColumn::new(&expr.to_string()))
+        match self {
+            Partitioning::Hash(exprs, part)
+            | Partitioning::KeyPartitioned(exprs, part) => {
+                let normalized_exprs = input_eq_properties
+                    .project_expressions(exprs, mapping)
+                    .zip(exprs)
+                    .map(|(proj_expr, expr)| {
+                        proj_expr.unwrap_or_else(|| {
+                            Arc::new(UnKnownColumn::new(&expr.to_string()))
+                        })
                     })
-                })
-                .collect();
-            Partitioning::Hash(normalized_exprs, *part)
-        } else {
-            self.clone()
+                    .collect();
+                if matches!(self, Partitioning::Hash(_, _)) {
+                    Partitioning::Hash(normalized_exprs, *part)
+                } else {
+                    Partitioning::KeyPartitioned(normalized_exprs, *part)
+                }
+            }
+            _ => self.clone(),
         }
     }
 }
@@ -231,6 +282,10 @@ impl PartialEq for Partitioning {
             {
                 true
             }
+            (
+                Partitioning::KeyPartitioned(exprs1, count1),
+                Partitioning::KeyPartitioned(exprs2, count2),
+            ) if physical_exprs_equal(exprs1, exprs2) && (count1 == count2) => true,
             _ => false,
         }
     }
@@ -339,4 +394,52 @@ mod tests {
 
         Ok(())
     }
+}
+
+#[test]
+fn key_partitioned_satisfies() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]));
+    let col_a =
+        Arc::new(Column::new_with_schema("a", &schema).unwrap()) as Arc<dyn PhysicalExpr>;
+    let col_b =
+        Arc::new(Column::new_with_schema("b", &schema).unwrap()) as Arc<dyn PhysicalExpr>;
+
+    let key_part_a = Partitioning::KeyPartitioned(vec![col_a.clone()], 10);
+    let key_part_ab =
+        Partitioning::KeyPartitioned(vec![col_a.clone(), col_b.clone()], 10);
+
+    let eq_props = EquivalenceProperties::new(schema);
+
+    // KeyPartitioned(A) satisfies Hash(A)
+    assert!(key_part_a.satisfy(
+        &Distribution::HashPartitioned(vec![col_a.clone()]),
+        &eq_props
+    ));
+
+    // KeyPartitioned(A) satisfies Hash(A, B) (Subset)
+    assert!(key_part_a.satisfy(
+        &Distribution::HashPartitioned(vec![col_a.clone(), col_b.clone()]),
+        &eq_props
+    ));
+
+    // KeyPartitioned(A, B) does NOT satisfy Hash(A) (Superset)
+    assert!(!key_part_ab.satisfy(
+        &Distribution::HashPartitioned(vec![col_a.clone()]),
+        &eq_props
+    ));
+
+    // KeyPartitioned(A, B) satisfies Hash(A, B)
+    assert!(key_part_ab.satisfy(
+        &Distribution::HashPartitioned(vec![col_a.clone(), col_b.clone()]),
+        &eq_props
+    ));
+
+    // KeyPartitioned(A, B) satisfies Hash(B, A) (Order shouldn't matter for subset check)
+    assert!(key_part_ab.satisfy(
+        &Distribution::HashPartitioned(vec![col_b.clone(), col_a.clone()]),
+        &eq_props
+    ));
 }

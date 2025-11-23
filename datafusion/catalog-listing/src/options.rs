@@ -61,6 +61,11 @@ pub struct ListingOptions {
     ///       multiple equivalent orderings, the outer `Vec` will have a
     ///       single element.
     pub file_sort_order: Vec<Vec<SortExpr>>,
+    /// If set to true, the files in a single hive partition (e.g. `year=2023/month=01`)
+    /// will be grouped into a single output partition (or multiple, provided they don't overlap with other hive partitions).
+    /// This preserves the property that each output partition contains disjoint partition keys,
+    /// enabling parallel aggregation optimization.
+    pub preserve_partition_values: bool,
 }
 
 impl ListingOptions {
@@ -78,6 +83,7 @@ impl ListingOptions {
             collect_stat: false,
             target_partitions: 1,
             file_sort_order: vec![],
+            preserve_partition_values: true,
         }
     }
 
@@ -89,6 +95,21 @@ impl ListingOptions {
     pub fn with_session_config_options(mut self, config: &SessionConfig) -> Self {
         self = self.with_target_partitions(config.target_partitions());
         self = self.with_collect_stat(config.collect_statistics());
+        self = self.with_preserve_partition_values(
+            config
+                .options()
+                .execution
+                .listing_table_preserve_partition_values,
+        );
+        self
+    }
+
+    /// Set `preserve_partition_values` on [`ListingOptions`] and returns self.
+    pub fn with_preserve_partition_values(
+        mut self,
+        preserve_partition_values: bool,
+    ) -> Self {
+        self.preserve_partition_values = preserve_partition_values;
         self
     }
 

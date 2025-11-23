@@ -1280,7 +1280,13 @@ pub fn ensure_distribution(
                         child = add_roundrobin_on_top(child, target_partitions)?;
                     }
                     // When inserting hash is necessary to satisfy hash requirement, insert hash repartition.
-                    if hash_necessary {
+                    // BUT: check if the current partitioning *already* satisfies the requirement.
+                    // (e.g. KeyPartitioned)
+                    let already_satisfied = child
+                        .plan
+                        .output_partitioning()
+                        .satisfy(&requirement, &child.plan.equivalence_properties());
+                    if hash_necessary && !already_satisfied {
                         child =
                             add_hash_on_top(child, exprs.to_vec(), target_partitions)?;
                     }

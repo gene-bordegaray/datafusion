@@ -439,6 +439,18 @@ impl BatchPartitioner {
                 random_state: ahash::RandomState::with_seeds(0, 0, 0, 0),
                 hash_buffer: vec![],
             },
+            Partitioning::KeyPartitioned(exprs, num_partitions) => {
+                // KeyPartitioned is treated like Hash for repartitioning purposes (distribute by key)
+                // although semantically it means "already partitioned".
+                // If we *must* repartition, we treat it as a hash distribution.
+                BatchPartitionerState::Hash {
+                    exprs,
+                    num_partitions,
+                    // Use fixed random hash
+                    random_state: ahash::RandomState::with_seeds(0, 0, 0, 0),
+                    hash_buffer: vec![],
+                }
+            }
             other => return not_impl_err!("Unsupported repartitioning scheme {other:?}"),
         };
 
@@ -1084,6 +1096,7 @@ impl ExecutionPlan for RepartitionExec {
         new_properties.partitioning = match new_properties.partitioning {
             RoundRobinBatch(_) => RoundRobinBatch(target_partitions),
             Hash(hash, _) => Hash(hash, target_partitions),
+            KeyPartitioned(hash, _) => KeyPartitioned(hash, target_partitions),
             UnknownPartitioning(_) => UnknownPartitioning(target_partitions),
         };
         Ok(Some(Arc::new(Self {

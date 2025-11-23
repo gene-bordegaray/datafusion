@@ -192,6 +192,8 @@ pub struct FileScanConfig {
     /// Expression adapter used to adapt filters and projections that are pushed down into the scan
     /// from the logical schema to the physical schema of the file.
     pub expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    /// Output partitioning of the scan
+    pub output_partitioning: Partitioning,
 }
 
 /// A builder for [`FileScanConfig`]'s.
@@ -261,6 +263,7 @@ pub struct FileScanConfigBuilder {
     new_lines_in_values: Option<bool>,
     batch_size: Option<usize>,
     expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    output_partitioning: Option<Partitioning>,
 }
 
 impl FileScanConfigBuilder {
@@ -287,6 +290,7 @@ impl FileScanConfigBuilder {
             constraints: None,
             batch_size: None,
             expr_adapter_factory: None,
+            output_partitioning: None,
         }
     }
 
@@ -415,6 +419,12 @@ impl FileScanConfigBuilder {
         self
     }
 
+    /// Set output partitioning
+    pub fn with_output_partitioning(mut self, output_partitioning: Partitioning) -> Self {
+        self.output_partitioning = Some(output_partitioning);
+        self
+    }
+
     /// Build the final [`FileScanConfig`] with all the configured settings.
     ///
     /// This method takes ownership of the builder and returns the constructed `FileScanConfig`.
@@ -433,6 +443,7 @@ impl FileScanConfigBuilder {
             new_lines_in_values,
             batch_size,
             expr_adapter_factory: expr_adapter,
+            output_partitioning,
         } = self;
 
         let constraints = constraints.unwrap_or_default();
@@ -454,6 +465,9 @@ impl FileScanConfigBuilder {
             )
         });
 
+        let output_partitioning = output_partitioning
+            .unwrap_or_else(|| Partitioning::UnknownPartitioning(file_groups.len()));
+
         FileScanConfig {
             object_store_url,
             file_source,
@@ -466,6 +480,7 @@ impl FileScanConfigBuilder {
             new_lines_in_values,
             batch_size,
             expr_adapter_factory: expr_adapter,
+            output_partitioning,
         }
     }
 }
@@ -487,6 +502,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             constraints: Some(config.constraints),
             batch_size: config.batch_size,
             expr_adapter_factory: config.expr_adapter_factory,
+            output_partitioning: Some(config.output_partitioning),
         }
     }
 }
@@ -570,7 +586,7 @@ impl DataSource for FileScanConfig {
     }
 
     fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(self.file_groups.len())
+        self.output_partitioning.clone()
     }
 
     fn eq_properties(&self) -> EquivalenceProperties {

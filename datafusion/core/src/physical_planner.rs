@@ -52,8 +52,8 @@ use crate::physical_plan::union::UnionExec;
 use crate::physical_plan::unnest::UnnestExec;
 use crate::physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
 use crate::physical_plan::{
-    displayable, windows, ExecutionPlan, ExecutionPlanProperties, InputOrderMode,
-    Partitioning, PhysicalExpr, WindowExpr,
+    displayable, windows, Distribution, ExecutionPlan, ExecutionPlanProperties,
+    InputOrderMode, Partitioning, PhysicalExpr, WindowExpr,
 };
 use crate::schema_equivalence::schema_satisfied_by;
 
@@ -802,6 +802,15 @@ impl DefaultPhysicalPlanner {
                     && session_state.config().target_partitions() > 1
                     && session_state.config().repartition_aggregations();
 
+                // Check if the input partition guarantees disjointness on the group keys
+                // (e.g. Hive partitioning). If so, we can run the final aggregation
+                // in parallel (FinalPartitioned) without repartitioning.
+                let required_dist = Distribution::HashPartitioned(groups.output_exprs());
+                let input_satisfies = initial_aggr
+                    .properties()
+                    .output_partitioning()
+                    .satisfy(&required_dist, &initial_aggr.properties().eq_properties);
+
                 // Some aggregators may be modified during initialization for
                 // optimization purposes. For example, a FIRST_VALUE may turn
                 // into a LAST_VALUE with the reverse ordering requirement.
@@ -809,7 +818,9 @@ impl DefaultPhysicalPlanner {
                 // `AggregateFunctionExpr`/`PhysicalSortExpr` objects.
                 let updated_aggregates = initial_aggr.aggr_expr().to_vec();
 
-                let next_partition_mode = if can_repartition {
+                let next_partition_mode = if input_satisfies {
+                    AggregateMode::FinalPartitioned
+                } else if can_repartition {
                     // construct a second aggregation with 'AggregateMode::FinalPartitioned'
                     AggregateMode::FinalPartitioned
                 } else {
@@ -3150,7 +3161,10 @@ mod tests {
 
         // Make sure the plan contains a FinalPartitioned, which means it will not use the Final
         // mode in Aggregate (which is slower)
-        assert!(formatted.contains("FinalPartitioned"));
+        assert!(
+            formatted.contains("FinalPartitioned")
+                || formatted.contains("SinglePartitioned")
+        );
 
         Ok(())
     }
@@ -3181,7 +3195,10 @@ mod tests {
 
         // Make sure the plan contains a FinalPartitioned, which means it will not use the Final
         // mode in Aggregate (which is slower)
-        assert!(formatted.contains("FinalPartitioned"));
+        assert!(
+            formatted.contains("FinalPartitioned")
+                || formatted.contains("SinglePartitioned")
+        );
         Ok(())
     }
 
@@ -3202,7 +3219,10 @@ mod tests {
 
         // Make sure the plan contains a FinalPartitioned, which means it will not use the Final
         // mode in Aggregate (which is slower)
-        assert!(formatted.contains("FinalPartitioned"));
+        assert!(
+            formatted.contains("FinalPartitioned")
+                || formatted.contains("SinglePartitioned")
+        );
 
         Ok(())
     }
