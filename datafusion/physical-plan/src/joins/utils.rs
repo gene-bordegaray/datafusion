@@ -142,6 +142,13 @@ pub fn adjust_right_output_partitioning(
                 .collect::<Result<_>>()?;
             Partitioning::Hash(new_exprs, *size)
         }
+        Partitioning::KeyPartitioned(exprs, size) => {
+            let new_exprs = exprs
+                .iter()
+                .map(|expr| add_offset_to_expr(Arc::clone(expr), left_columns_len as _))
+                .collect::<Result<_>>()?;
+            Partitioning::KeyPartitioned(new_exprs, *size)
+        }
         result => result.clone(),
     };
     Ok(result)

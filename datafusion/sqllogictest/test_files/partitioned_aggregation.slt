@@ -365,6 +365,77 @@ DROP TABLE single_col_16_target;
 statement ok
 DROP TABLE single_col_2_target;
 
+# Test 10: KeyPartitioned propagates through join - simplified version
+# Create dimension table (small, will be collected)
+statement ok
+CREATE TABLE dim_staging (
+    d_id INT,
+    category TEXT
+) AS VALUES
+    (1, 'A'), (2, 'B'), (3, 'C'), (4, 'D');
+
+query I
+COPY (SELECT * FROM dim_staging)
+TO 'test_files/scratch/partitioned_aggregation/dim/data.parquet'
+STORED AS PARQUET;
+----
+4
+
+statement ok
+CREATE EXTERNAL TABLE dim_table (
+    d_id INT,
+    category TEXT
+)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/partitioned_aggregation/dim/';
+
+# Join partitioned fact table with dimension, then aggregate on partition key
+# Should use SinglePartitioned because KeyPartitioned propagates through join
+query TT
+EXPLAIN SELECT f.part_col, COUNT(*), MAX(d.category)
+FROM single_col_table f
+JOIN dim_table d ON f.part_col = d.d_id
+GROUP BY f.part_col
+ORDER BY f.part_col
+----
+logical_plan
+01)Sort: f.part_col ASC NULLS LAST
+02)--Projection: f.part_col, count(Int64(1)) AS count(*), max(d.category)
+03)----Aggregate: groupBy=[[f.part_col]], aggr=[[count(Int64(1)), max(d.category)]]
+04)------Projection: f.part_col, d.category
+05)--------Inner Join: f.part_col = d.d_id
+06)----------SubqueryAlias: f
+07)------------TableScan: single_col_table projection=[part_col]
+08)----------SubqueryAlias: d
+09)------------TableScan: dim_table projection=[d_id, category]
+physical_plan
+01)SortPreservingMergeExec: [part_col@0 ASC NULLS LAST]
+02)--SortExec: expr=[part_col@0 ASC NULLS LAST], preserve_partitioning=[true]
+03)----ProjectionExec: expr=[part_col@0 as part_col, count(Int64(1))@1 as count(*), max(d.category)@2 as max(d.category)]
+04)------AggregateExec: mode=SinglePartitioned, gby=[part_col@0 as part_col], aggr=[count(Int64(1)), max(d.category)]
+05)--------ProjectionExec: expr=[part_col@1 as part_col, category@0 as category]
+06)----------CoalesceBatchesExec: target_batch_size=8192
+07)------------HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d_id@0, part_col@0)], projection=[category@1, part_col@2]
+08)--------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/dim/data.parquet]]}, projection=[d_id, category], file_type=parquet
+09)--------------DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=1/0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=2/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=3/2.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=4/3.parquet]]}, projection=[part_col], file_type=parquet, predicate=DynamicFilter [ empty ]
+
+query IIT rowsort
+SELECT f.part_col, COUNT(*), MAX(d.category)
+FROM single_col_table f
+JOIN dim_table d ON f.part_col = d.d_id
+GROUP BY f.part_col
+----
+1 3 A
+2 2 B
+3 1 C
+4 1 D
+
+statement ok
+DROP TABLE dim_table;
+
+statement ok
+DROP TABLE dim_staging;
+
 # Cleanup
 statement ok
 DROP TABLE single_col_table;
