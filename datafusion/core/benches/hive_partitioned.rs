@@ -37,7 +37,7 @@ fn generate_partitioned_data(
     num_partitions: usize,
     rows_per_partition: usize,
 ) {
-    let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, true)]));
 
     let props = WriterProperties::builder().build();
 
@@ -63,59 +63,156 @@ fn generate_partitioned_data(
     }
 }
 
+/// Generate dimension table for join benchmarks
+fn generate_dimension_table(base_dir: &Path, num_dimensions: usize) {
+    use arrow::array::StringArray;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("dim_id", DataType::Int32, false),
+        Field::new("category", DataType::Utf8, false),
+    ]));
+
+    let props = WriterProperties::builder().build();
+    let dim_dir = base_dir.join("dim");
+    fs::create_dir_all(&dim_dir).unwrap();
+    let file_path = dim_dir.join("dimension.parquet");
+    let file = File::create(file_path).unwrap();
+
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+
+    // Generate dimension data: dim_id from 0 to num_dimensions-1
+    let dim_ids: Vec<i32> = (0..num_dimensions as i32).collect();
+    let categories: Vec<String> = (0..num_dimensions)
+        .map(|i| format!("Category_{}", i % 10))  // 10 categories cycling
+        .collect();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(dim_ids)) as ArrayRef,
+            Arc::new(StringArray::from(categories)) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
 /// Save execution plans to file
-async fn save_plans(table_path: &str, output_file: &Path) {
-    let query = "SELECT part_col, count(*), sum(val), avg(val) FROM t GROUP BY part_col";
+async fn save_plans(fact_table_path: &str, dim_table_path: &str, output_file: &Path) {
+    let agg_query = "SELECT part_col, count(*), sum(val), avg(val) FROM fact GROUP BY part_col";
+    let join_query = "SELECT f.part_col, COUNT(*), MAX(d.category) FROM fact f JOIN dim d ON f.part_col = d.dim_id GROUP BY f.part_col";
     let mut file = File::create(output_file).unwrap();
 
-    writeln!(file, "KeyPartitioned Aggregation Benchmark Plans\n").unwrap();
-    writeln!(file, "Query: {query}\n").unwrap();
+    writeln!(file, "KeyPartitioned Optimization Benchmark Plans\n").unwrap();
 
-    // Optimized plan
+    let fact_options = ParquetReadOptions {
+        table_partition_cols: vec![("part_col".to_string(), DataType::Int32)],
+        ..Default::default()
+    };
+
+    // Test 1: Simple aggregation on partition key
+    writeln!(file, "========================================").unwrap();
+    writeln!(file, "TEST 1: Simple Aggregation on Partition Key").unwrap();
+    writeln!(file, "Query: {}\n", agg_query).unwrap();
+
+    // Optimized
     let config_opt = SessionConfig::new().with_target_partitions(20).set_bool(
         "datafusion.execution.listing_table_preserve_partition_values",
         true,
     );
     let ctx_opt = SessionContext::new_with_config(config_opt);
-    let options = ParquetReadOptions {
-        table_partition_cols: vec![("part_col".to_string(), DataType::Int32)],
-        ..Default::default()
-    };
     ctx_opt
-        .register_parquet("t", table_path, options.clone())
+        .register_parquet("fact", fact_table_path, fact_options.clone())
         .await
         .unwrap();
 
-    let df_opt = ctx_opt.sql(query).await.unwrap();
+    let df_opt = ctx_opt.sql(agg_query).await.unwrap();
     let plan_opt = df_opt
         .explain(false, false)
         .unwrap()
         .collect()
         .await
         .unwrap();
-    writeln!(file, "=== WITH KeyPartitioned Optimization ===").unwrap();
+    writeln!(file, "=== WITH KeyPartitioned ===").unwrap();
     writeln!(file, "{}\n", pretty_format_batches(&plan_opt).unwrap()).unwrap();
 
-    // Unoptimized plan
+    // Unoptimized
     let config_unopt = SessionConfig::new().with_target_partitions(20).set_bool(
         "datafusion.execution.listing_table_preserve_partition_values",
         false,
     );
     let ctx_unopt = SessionContext::new_with_config(config_unopt);
     ctx_unopt
-        .register_parquet("t", table_path, options)
+        .register_parquet("fact", fact_table_path, fact_options.clone())
         .await
         .unwrap();
 
-    let df_unopt = ctx_unopt.sql(query).await.unwrap();
+    let df_unopt = ctx_unopt.sql(agg_query).await.unwrap();
     let plan_unopt = df_unopt
         .explain(false, false)
         .unwrap()
         .collect()
         .await
         .unwrap();
-    writeln!(file, "=== WITHOUT KeyPartitioned Optimization ===").unwrap();
-    writeln!(file, "{}", pretty_format_batches(&plan_unopt).unwrap()).unwrap();
+    writeln!(file, "=== WITHOUT KeyPartitioned ===").unwrap();
+    writeln!(file, "{}\n", pretty_format_batches(&plan_unopt).unwrap()).unwrap();
+
+    // Test 2: Join + aggregation
+    writeln!(file, "========================================").unwrap();
+    writeln!(file, "TEST 2: Join + Aggregation on Partition Key").unwrap();
+    writeln!(file, "Query: {}\n", join_query).unwrap();
+
+    // Optimized with join
+    let config_opt_join = SessionConfig::new().with_target_partitions(20).set_bool(
+        "datafusion.execution.listing_table_preserve_partition_values",
+        true,
+    );
+    let ctx_opt_join = SessionContext::new_with_config(config_opt_join);
+    ctx_opt_join
+        .register_parquet("fact", fact_table_path, fact_options.clone())
+        .await
+        .unwrap();
+    ctx_opt_join
+        .register_parquet("dim", dim_table_path, ParquetReadOptions::default())
+        .await
+        .unwrap();
+
+    let df_opt_join = ctx_opt_join.sql(join_query).await.unwrap();
+    let plan_opt_join = df_opt_join
+        .explain(false, false)
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    writeln!(file, "=== WITH KeyPartitioned (Join Propagation) ===").unwrap();
+    writeln!(file, "{}\n", pretty_format_batches(&plan_opt_join).unwrap()).unwrap();
+
+    // Unoptimized with join
+    let config_unopt_join = SessionConfig::new().with_target_partitions(20).set_bool(
+        "datafusion.execution.listing_table_preserve_partition_values",
+        false,
+    );
+    let ctx_unopt_join = SessionContext::new_with_config(config_unopt_join);
+    ctx_unopt_join
+        .register_parquet("fact", fact_table_path, fact_options)
+        .await
+        .unwrap();
+    ctx_unopt_join
+        .register_parquet("dim", dim_table_path, ParquetReadOptions::default())
+        .await
+        .unwrap();
+
+    let df_unopt_join = ctx_unopt_join.sql(join_query).await.unwrap();
+    let plan_unopt_join = df_unopt_join
+        .explain(false, false)
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    writeln!(file, "=== WITHOUT KeyPartitioned ===").unwrap();
+    writeln!(file, "{}", pretty_format_batches(&plan_unopt_join).unwrap()).unwrap();
 }
 
 fn run_benchmark(c: &mut Criterion) {
@@ -126,14 +223,18 @@ fn run_benchmark(c: &mut Criterion) {
     let tmp_dir = TempDir::new().unwrap();
 
     generate_partitioned_data(tmp_dir.path(), partitions, rows_per_partition);
-    let table_path = tmp_dir.path().to_str().unwrap();
+    generate_dimension_table(tmp_dir.path(), partitions);  // Generate dimension table matching partition count
+
+    let fact_table_path = tmp_dir.path().to_str().unwrap();
+    let dim_table_path = tmp_dir.path().join("dim");
+    let dim_table_str = dim_table_path.to_str().unwrap();
 
     let rt = Runtime::new().unwrap();
 
     // Save execution plans if SAVE_PLANS env var is set
     if std::env::var("SAVE_PLANS").is_ok() {
         let output_path = Path::new("hive_partitioned_plans.txt");
-        rt.block_on(save_plans(table_path, output_path));
+        rt.block_on(save_plans(fact_table_path, dim_table_str, output_path));
         println!("Execution plans saved to {}", output_path.display());
     }
 
@@ -153,7 +254,7 @@ fn run_benchmark(c: &mut Criterion) {
                 ..Default::default()
             };
 
-            ctx.register_parquet("t", table_path, options)
+            ctx.register_parquet("t", fact_table_path, options)
                 .await
                 .unwrap();
 
@@ -175,7 +276,7 @@ fn run_benchmark(c: &mut Criterion) {
                 ..Default::default()
             };
 
-            ctx.register_parquet("t", table_path, options)
+            ctx.register_parquet("t", fact_table_path, options)
                 .await
                 .unwrap();
 
