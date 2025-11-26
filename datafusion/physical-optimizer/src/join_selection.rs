@@ -37,7 +37,7 @@ use datafusion_physical_plan::joins::{
     CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
     StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
-use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
 use std::sync::Arc;
 
 /// The [`JoinSelection`] rule tries to modify a given plan so that it can
@@ -249,6 +249,16 @@ pub(crate) fn partitioned_hash_join(
     }
 }
 
+/// Returns true if the join outputs KeyPartitioned data, which should use Partitioned mode.
+fn should_use_partitioned_join_for_key_partitioning(
+    hash_join: &HashJoinExec,
+) -> Result<bool> {
+    Ok(matches!(
+        hash_join.properties().output_partitioning(),
+        Partitioning::KeyPartitioned(..)
+    ))
+}
+
 /// This subrule tries to modify a given plan so that it can
 /// optimize hash and cross joins in the plan according to available statistical information.
 fn statistical_join_selection_subrule(
@@ -259,16 +269,23 @@ fn statistical_join_selection_subrule(
     let transformed =
         if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
             match hash_join.partition_mode() {
-                PartitionMode::Auto => try_collect_left(
-                    hash_join,
-                    false,
-                    collect_threshold_byte_size,
-                    collect_threshold_num_rows,
-                )?
-                .map_or_else(
-                    || partitioned_hash_join(hash_join).map(Some),
-                    |v| Ok(Some(v)),
-                )?,
+                PartitionMode::Auto => {
+                    // Prefer Partitioned mode for KeyPartitioned joins
+                    if should_use_partitioned_join_for_key_partitioning(hash_join)? {
+                        partitioned_hash_join(hash_join).map(Some)?
+                    } else {
+                        try_collect_left(
+                            hash_join,
+                            false,
+                            collect_threshold_byte_size,
+                            collect_threshold_num_rows,
+                        )?
+                        .map_or_else(
+                            || partitioned_hash_join(hash_join).map(Some),
+                            |v| Ok(Some(v)),
+                        )?
+                    }
+                }
                 PartitionMode::CollectLeft => try_collect_left(hash_join, true, 0, 0)?
                     .map_or_else(
                         || partitioned_hash_join(hash_join).map(Some),

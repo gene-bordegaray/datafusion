@@ -571,9 +571,24 @@ impl HashJoinExec {
             PartitionMode::CollectLeft => {
                 asymmetric_join_output_partitioning(left, right, &join_type)?
             }
-            PartitionMode::Auto => Partitioning::UnknownPartitioning(
-                right.output_partitioning().partition_count(),
-            ),
+            PartitionMode::Auto => {
+                // Check if both sides are KeyPartitioned on compatible join keys
+                // If so, treat like Partitioned mode for output partitioning purposes
+                let left_partitioning = left.output_partitioning();
+                let right_partitioning = right.output_partitioning();
+
+                let both_key_partitioned = matches!(left_partitioning, Partitioning::KeyPartitioned(..))
+                    && matches!(right_partitioning, Partitioning::KeyPartitioned(..));
+
+                if both_key_partitioned {
+                    // Use symmetric join output partitioning to preserve KeyPartitioning
+                    symmetric_join_output_partitioning(left, right, &join_type)?
+                } else {
+                    Partitioning::UnknownPartitioning(
+                        right.output_partitioning().partition_count(),
+                    )
+                }
+            }
             PartitionMode::Partitioned => {
                 symmetric_join_output_partitioning(left, right, &join_type)?
             }
