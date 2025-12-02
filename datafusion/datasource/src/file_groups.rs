@@ -481,6 +481,49 @@ impl FileGroup {
             .collect()
     }
 
+    /// Consolidates multiple file groups into fewer groups by combining them.
+    ///
+    /// # Data Skew Limitation
+    ///
+    /// This function uses round-robin distribution (i % target_count) to assign
+    /// file groups to consolidated partitions. While this works well for uniform
+    /// data, it does not account for data skew in production workloads:
+    ///
+    /// - **File size skew**: Some partition keys may have much larger files than others
+    /// - **Cardinality skew**: Some keys may have many more rows than others
+    ///
+    /// This limitation is especially important for KeyPartitioned queries where there
+    /// is no hash redistribution to rebalance work across partitions. In cases with
+    /// significant skew, round-robin can lead to unbalanced execution where some
+    /// partitions do significantly more work than others.
+    ///
+    /// TODO: Future improvements for handling data skew:
+    /// - Size-aware assignment: Distribute file groups based on total file size
+    /// - Statistics-based assignment: Use row counts/statistics if available
+    pub fn consolidate_file_groups(
+        groups: Vec<FileGroup>,
+        target_count: usize,
+    ) -> Vec<FileGroup> {
+        if groups.is_empty() || groups.len() <= target_count {
+            return groups;
+        }
+
+        debug!(
+            "Consolidating {} partition groups into {} groups using round-robin distribution",
+            groups.len(),
+            target_count
+        );
+
+        let mut consolidated = vec![FileGroup::default(); target_count];
+
+        for (i, group) in groups.into_iter().enumerate() {
+            let target_idx = i % target_count;
+            consolidated[target_idx].files.extend(group.files);
+        }
+
+        consolidated
+    }
+
     /// Returns the unique set of partition values represented by this group,
     /// if and only if all files share the same values.
     pub fn unique_partition_values(&self) -> Option<&[ScalarValue]> {
@@ -638,6 +681,8 @@ impl DerefMut for CompareByRangeSize {
 
 #[cfg(test)]
 mod test {
+    use datafusion_common::ScalarValue;
+
     use super::*;
 
     /// Empty file won't get partitioned
@@ -1078,6 +1123,17 @@ mod test {
         PartitionedFile::new(path, file_size)
     }
 
+    /// Helper to create file with partition values
+    fn pfile_with_parts(
+        path: &str,
+        size: u64,
+        values: Vec<ScalarValue>,
+    ) -> PartitionedFile {
+        let mut file = pfile(path, size);
+        file.partition_values = values;
+        file
+    }
+
     /// repartition the file groups both with and without preserving order
     /// asserting they return the same value and returns that value
     fn repartition_test(
@@ -1096,19 +1152,6 @@ mod test {
 
     #[test]
     fn test_split_by_partition_values() {
-        use datafusion_common::ScalarValue;
-
-        // Helper to create file with partition values
-        fn pfile_with_parts(
-            path: &str,
-            size: u64,
-            values: Vec<ScalarValue>,
-        ) -> PartitionedFile {
-            let mut file = pfile(path, size);
-            file.partition_values = values;
-            file
-        }
-
         // Case 1: Empty group returns empty vec
         let empty_group = FileGroup::new(vec![]);
         assert_eq!(empty_group.split_by_partition_values().len(), 0);
@@ -1215,5 +1258,97 @@ mod test {
         let file1 = pfile("a", 100);
         let group = FileGroup::new(vec![file1]);
         assert_eq!(group.unique_partition_values(), None);
+    }
+
+    #[test]
+    fn test_consolidate_file_groups() {
+        // Case 1: Empty groups
+        let result = FileGroup::consolidate_file_groups(vec![], 10);
+        assert_eq!(result.len(), 0);
+
+        // Case 2: Fewer groups than target - no consolidation needed
+        let groups = vec![
+            FileGroup::new(vec![pfile("a", 100)]),
+            FileGroup::new(vec![pfile("b", 100)]),
+            FileGroup::new(vec![pfile("c", 100)]),
+        ];
+        let result = FileGroup::consolidate_file_groups(groups.clone(), 10);
+        assert_eq!(result.len(), 3);
+
+        // Case 3: More groups than target - consolidate with round-robin
+        let groups: Vec<FileGroup> = (0..50)
+            .map(|i| {
+                FileGroup::new(vec![pfile_with_parts(
+                    &format!("file_{}", i),
+                    100,
+                    vec![ScalarValue::Int32(Some(i))],
+                )])
+            })
+            .collect();
+
+        let result = FileGroup::consolidate_file_groups(groups, 20);
+        assert_eq!(result.len(), 20);
+
+        // Verify round-robin distribution
+        // Group 0 should have files [0, 20, 40]
+        assert_eq!(result[0].len(), 3);
+        assert_eq!(
+            result[0].files()[0].partition_values,
+            vec![ScalarValue::Int32(Some(0))]
+        );
+        assert_eq!(
+            result[0].files()[1].partition_values,
+            vec![ScalarValue::Int32(Some(20))]
+        );
+        assert_eq!(
+            result[0].files()[2].partition_values,
+            vec![ScalarValue::Int32(Some(40))]
+        );
+
+        // Group 1 should have files [1, 21, 41]
+        assert_eq!(result[1].len(), 3);
+        assert_eq!(
+            result[1].files()[0].partition_values,
+            vec![ScalarValue::Int32(Some(1))]
+        );
+
+        // Group 19 should have files [19, 39]
+        assert_eq!(result[19].len(), 2);
+        assert_eq!(
+            result[19].files()[0].partition_values,
+            vec![ScalarValue::Int32(Some(19))]
+        );
+        assert_eq!(
+            result[19].files()[1].partition_values,
+            vec![ScalarValue::Int32(Some(39))]
+        );
+
+        // Case 4: Verify each partition value appears in exactly one group
+        let groups: Vec<FileGroup> = (0..100)
+            .map(|i| {
+                FileGroup::new(vec![pfile_with_parts(
+                    &format!("file_{}", i),
+                    100,
+                    vec![ScalarValue::Int32(Some(i))],
+                )])
+            })
+            .collect();
+
+        let result = FileGroup::consolidate_file_groups(groups, 20);
+
+        let mut all_values = std::collections::HashSet::new();
+        for group in &result {
+            for file in group.files() {
+                if let Some(ScalarValue::Int32(Some(v))) = file.partition_values.first() {
+                    // Should not see duplicate values
+                    assert!(
+                        all_values.insert(*v),
+                        "Partition value {} appears in multiple groups",
+                        v
+                    );
+                }
+            }
+        }
+        assert_eq!(all_values.len(), 100);
     }
 }

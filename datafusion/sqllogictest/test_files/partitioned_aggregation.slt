@@ -77,28 +77,28 @@ CREATE TABLE multi_col_staging (
     (2025, 2, 1, 400);
 
 query I
-COPY (SELECT * FROM multi_col_staging WHERE year = 2024 AND month = 1)
+COPY (SELECT * FROM multi_col_staging WHERE year = 2024 AND month = 1 ORDER BY year, month, day)
 TO 'test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=1/data.parquet'
 STORED AS PARQUET;
 ----
 2
 
 query I
-COPY (SELECT * FROM multi_col_staging WHERE year = 2024 AND month = 2)
+COPY (SELECT * FROM multi_col_staging WHERE year = 2024 AND month = 2 ORDER BY year, month, day)
 TO 'test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=2/data.parquet'
 STORED AS PARQUET;
 ----
 2
 
 query I
-COPY (SELECT * FROM multi_col_staging WHERE year = 2025 AND month = 1)
+COPY (SELECT * FROM multi_col_staging WHERE year = 2025 AND month = 1 ORDER BY year, month, day)
 TO 'test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=1/data.parquet'
 STORED AS PARQUET;
 ----
 2
 
 query I
-COPY (SELECT * FROM multi_col_staging WHERE year = 2025 AND month = 2)
+COPY (SELECT * FROM multi_col_staging WHERE year = 2025 AND month = 2 ORDER BY year, month, day)
 TO 'test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=2/data.parquet'
 STORED AS PARQUET;
 ----
@@ -122,6 +122,7 @@ CREATE EXTERNAL TABLE multi_col_table (
     val INT
 )
 STORED AS PARQUET
+WITH ORDER (year, month, day)
 LOCATION 'test_files/scratch/partitioned_aggregation/multi_col/'
 PARTITIONED BY (year, month);
 
@@ -188,7 +189,7 @@ physical_plan
 08)--------------DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=1/0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=2/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=3/2.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=4/3.parquet]]}, projection=[val], file_type=parquet
 
 # Test 4: Multi-column partition - GROUP BY all partition columns + other (superset)
-# Should use SinglePartitioned
+# Should use SinglePartitioned with full sort preservation (ordering_mode=Sorted, no SortExec)
 query TT
 EXPLAIN SELECT year, month, day, count(*) FROM multi_col_table GROUP BY year, month, day ORDER BY year, month, day
 ----
@@ -199,10 +200,9 @@ logical_plan
 04)------TableScan: multi_col_table projection=[day, year, month]
 physical_plan
 01)SortPreservingMergeExec: [year@0 ASC NULLS LAST, month@1 ASC NULLS LAST, day@2 ASC NULLS LAST]
-02)--SortExec: expr=[year@0 ASC NULLS LAST, month@1 ASC NULLS LAST, day@2 ASC NULLS LAST], preserve_partitioning=[true]
-03)----ProjectionExec: expr=[year@0 as year, month@1 as month, day@2 as day, count(Int64(1))@3 as count(*)]
-04)------AggregateExec: mode=SinglePartitioned, gby=[year@1 as year, month@2 as month, day@0 as day], aggr=[count(Int64(1))]
-05)--------DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=1/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=2/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=1/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=2/data.parquet]]}, projection=[day, year, month], file_type=parquet
+02)--ProjectionExec: expr=[year@0 as year, month@1 as month, day@2 as day, count(Int64(1))@3 as count(*)]
+03)----AggregateExec: mode=SinglePartitioned, gby=[year@1 as year, month@2 as month, day@0 as day], aggr=[count(Int64(1))], ordering_mode=Sorted
+04)------DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=1/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=2/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=1/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=2/data.parquet]]}, projection=[day, year, month], output_ordering=[year@1 ASC NULLS LAST, month@2 ASC NULLS LAST, day@0 ASC NULLS LAST], file_type=parquet
 
 query IIII
 SELECT year, month, day, count(*) FROM multi_col_table GROUP BY year, month, day ORDER BY year, month, day
@@ -215,6 +215,30 @@ SELECT year, month, day, count(*) FROM multi_col_table GROUP BY year, month, day
 2025 1 2 1
 2025 2 1 1
 
+# Test 4b: Verify sort preservation with WITH ORDER clause
+# Should use SinglePartitioned with ordering_mode=Sorted (no SortExec before aggregation)
+# The output_ordering from DataSourceExec should be preserved through the aggregation
+# Note: No ProjectionExec needed because aggregation already produces correctly ordered output
+query TT
+EXPLAIN SELECT year, month, sum(val) FROM multi_col_table GROUP BY year, month ORDER BY year, month
+----
+logical_plan
+01)Sort: multi_col_table.year ASC NULLS LAST, multi_col_table.month ASC NULLS LAST
+02)--Aggregate: groupBy=[[multi_col_table.year, multi_col_table.month]], aggr=[[sum(CAST(multi_col_table.val AS Int64))]]
+03)----TableScan: multi_col_table projection=[val, year, month]
+physical_plan
+01)SortPreservingMergeExec: [year@0 ASC NULLS LAST, month@1 ASC NULLS LAST]
+02)--AggregateExec: mode=SinglePartitioned, gby=[year@1 as year, month@2 as month], aggr=[sum(multi_col_table.val)], ordering_mode=Sorted
+03)----DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=1/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=2/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=1/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=2/data.parquet]]}, projection=[val, year, month], output_ordering=[year@1 ASC NULLS LAST, month@2 ASC NULLS LAST], file_type=parquet
+
+query III
+SELECT year, month, sum(val) FROM multi_col_table GROUP BY year, month ORDER BY year, month
+----
+2024 1 201
+2024 2 401
+2025 1 601
+2025 2 400
+
 # Test 5: Multi-column partition - GROUP BY only first partition column (subset)
 # Should use FinalPartitioned with Repartition
 query TT
@@ -226,11 +250,12 @@ logical_plan
 03)----TableScan: multi_col_table projection=[year]
 physical_plan
 01)ProjectionExec: expr=[year@0 as year, count(Int64(1))@1 as count(*)]
-02)--AggregateExec: mode=FinalPartitioned, gby=[year@0 as year], aggr=[count(Int64(1))]
-03)----CoalesceBatchesExec: target_batch_size=8192
-04)------RepartitionExec: partitioning=Hash([year@0], 4), input_partitions=4
-05)--------AggregateExec: mode=Partial, gby=[year@0 as year], aggr=[count(Int64(1))]
-06)----------DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=1/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=2/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=1/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=2/data.parquet]]}, projection=[year], file_type=parquet
+02)--AggregateExec: mode=FinalPartitioned, gby=[year@0 as year], aggr=[count(Int64(1))], ordering_mode=Sorted
+03)----SortExec: expr=[year@0 ASC NULLS LAST], preserve_partitioning=[true]
+04)------CoalesceBatchesExec: target_batch_size=8192
+05)--------RepartitionExec: partitioning=Hash([year@0], 4), input_partitions=4
+06)----------AggregateExec: mode=Partial, gby=[year@0 as year], aggr=[count(Int64(1))], ordering_mode=Sorted
+07)------------DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=1/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=2/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=1/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=2/data.parquet]]}, projection=[year], output_ordering=[year@0 ASC NULLS LAST], file_type=parquet
 
 query II
 SELECT year, count(*) FROM multi_col_table GROUP BY year ORDER BY year
@@ -248,9 +273,9 @@ logical_plan
 03)----TableScan: multi_col_table projection=[year, month]
 physical_plan
 01)ProjectionExec: expr=[year@0 as year, count(Int64(1))@3 as count(*)]
-02)--AggregateExec: mode=FinalPartitioned, gby=[year@0 as year, month@1 as month, __grouping_id@2 as __grouping_id], aggr=[count(Int64(1))]
+02)--AggregateExec: mode=FinalPartitioned, gby=[year@0 as year, month@1 as month, __grouping_id@2 as __grouping_id], aggr=[count(Int64(1))], ordering_mode=PartiallySorted([0, 1])
 03)----AggregateExec: mode=Partial, gby=[(year@0 as year, NULL as month), (NULL as year, month@1 as month)], aggr=[count(Int64(1))]
-04)------DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=1/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=2/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=1/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=2/data.parquet]]}, projection=[year, month], file_type=parquet
+04)------DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=1/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2024/month=2/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=1/data.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/multi_col/year=2025/month=2/data.parquet]]}, projection=[year, month], output_ordering=[year@0 ASC NULLS LAST, month@1 ASC NULLS LAST], file_type=parquet
 
 # Test 7: With preserve_partition_values=false, optimization should NOT apply
 statement ok
@@ -349,7 +374,7 @@ physical_plan
 02)--SortExec: expr=[part_col@0 ASC NULLS LAST], preserve_partitioning=[true]
 03)----ProjectionExec: expr=[part_col@0 as part_col, count(Int64(1))@1 as count(*)]
 04)------AggregateExec: mode=SinglePartitioned, gby=[part_col@0 as part_col], aggr=[count(Int64(1))]
-05)--------DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=1/0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=2/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=3/2.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=4/3.parquet]]}, projection=[part_col], file_type=parquet
+05)--------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=1/0.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=3/2.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=2/1.parquet, WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/partitioned_aggregation/part_col=4/3.parquet]]}, projection=[part_col], file_type=parquet
 
 query II
 SELECT part_col, count(*) FROM single_col_2_target GROUP BY part_col ORDER BY part_col

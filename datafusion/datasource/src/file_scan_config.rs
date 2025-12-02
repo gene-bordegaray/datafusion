@@ -792,13 +792,30 @@ impl FileScanConfig {
         if partition_fields.is_empty() {
             return None;
         }
-        let mut seen = HashSet::with_capacity(self.file_groups.len());
+
+        // Verify KeyPartitioned property: each partition value tuple appears in exactly one group.
+        let mut seen = HashSet::new();
         for group in &self.file_groups {
-            let values = group.unique_partition_values()?;
-            if !seen.insert(values) {
-                return None;
+            if group.files().is_empty() {
+                continue;
+            }
+
+            for file in group.files() {
+                if file.partition_values.is_empty() {
+                    // If any file has no partition values, we can't use KeyPartitioned
+                    return None;
+                }
+
+                if !seen.insert(&file.partition_values) {
+                    debug!(
+                        "Partition values {:?} appear in multiple file groups, disabling KeyPartitioned optimization",
+                        file.partition_values
+                    );
+                    return None;
+                }
             }
         }
+
         let schema = self.file_source.table_schema().table_schema();
         let mut exprs = Vec::with_capacity(partition_fields.len());
         for field in partition_fields {

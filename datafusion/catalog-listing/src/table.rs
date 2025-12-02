@@ -669,7 +669,18 @@ impl ListingTable {
 
         let target_partitions = self.options.target_partitions.max(1);
         let file_groups = if self.options.preserve_partition_values {
-            file_group.split_by_partition_values()
+            let mut partition_groups = file_group.split_by_partition_values();
+
+            // If we have more partition groups than target parallelism,
+            // consolidate them to avoid excessive task scheduling overhead
+            if partition_groups.len() > target_partitions {
+                partition_groups = FileGroup::consolidate_file_groups(
+                    partition_groups,
+                    target_partitions,
+                );
+            }
+
+            partition_groups
         } else {
             file_group.split_files(target_partitions)
         };
