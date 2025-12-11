@@ -911,10 +911,19 @@ fn add_hash_on_top(
         .output_partitioning()
         .satisfy(&dist, input.plan.equivalence_properties());
 
+    // Check if input already has hash partitioning
+    let has_hash_partitioning = matches!(
+        input.plan.output_partitioning(),
+        Partitioning::Hash(_, _)
+    );
+
     // Add hash repartitioning when:
     // - The hash distribution requirement is not satisfied, or
-    // - We can increase parallelism by adding hash partitioning.
-    if !satisfied || n_target > input.plan.output_partitioning().partition_count() {
+    // - We can increase parallelism by adding hash partitioning (but not if already hash partitioned).
+    //
+    // When data is already hash partitioned correctly, don't repartition just to increase
+    // parallelism, as this breaks file-level partitioning and is counterproductive.
+    if !satisfied || (n_target > input.plan.output_partitioning().partition_count() && !has_hash_partitioning) {
         // When there is an existing ordering, we preserve ordering during
         // repartition. This will be rolled back in the future if any of the
         // following conditions is true:

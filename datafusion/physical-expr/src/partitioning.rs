@@ -171,6 +171,23 @@ impl Partitioning {
                         // If the required exprs do not match, need to leverage the eq_properties provided by the child
                         // and normalize both exprs based on the equivalent groups.
                         if !fast_match {
+                            // Check if partition_exprs is a subset of required_exprs (superset satisfaction)
+                            // DataFusion's Hash partitioning guarantees that all rows with the same value
+                            // combination of partition columns are in the same partition.
+                            if partition_exprs.len() < required_exprs.len() {
+                                let is_subset = partition_exprs.iter().all(|p_expr| {
+                                    required_exprs.iter().any(|r_expr| {
+                                        physical_exprs_equal(
+                                            &[p_expr.clone()],
+                                            &[r_expr.clone()],
+                                        )
+                                    })
+                                });
+                                if is_subset {
+                                    return true;
+                                }
+                            }
+
                             let eq_groups = eq_properties.eq_group();
                             if !eq_groups.is_empty() {
                                 let normalized_required_exprs = required_exprs
