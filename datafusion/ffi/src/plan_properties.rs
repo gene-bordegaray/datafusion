@@ -171,7 +171,8 @@ impl TryFrom<FFI_PlanProperties> for PlanProperties {
             })
             .unwrap_or_default();
 
-        let partitioning = unsafe { (ffi_props.output_partitioning)(&ffi_props) };
+        let partitioning = unsafe { (ffi_props.output_partitioning)(&ffi_props) }
+            .try_to_partitioning()?;
 
         let eq_properties = if sort_exprs.is_empty() {
             EquivalenceProperties::new(Arc::new(schema))
@@ -187,7 +188,7 @@ impl TryFrom<FFI_PlanProperties> for PlanProperties {
 
         Ok(PlanProperties::new(
             eq_properties,
-            (&partitioning).into(),
+            partitioning,
             emission_type,
             boundedness,
         ))
@@ -260,8 +261,10 @@ impl From<FFI_EmissionType> for EmissionType {
 
 #[cfg(test)]
 mod tests {
+    use arrow_schema::SortOptions;
     use datafusion::physical_expr::PhysicalSortExpr;
-    use datafusion::physical_plan::Partitioning;
+    use datafusion::physical_plan::{Partitioning, RangePartitioning, SplitPoint};
+    use datafusion_common::ScalarValue;
 
     use super::*;
 
@@ -280,6 +283,39 @@ mod tests {
             EmissionType::Incremental,
             Boundedness::Bounded,
         ))
+    }
+
+    fn create_range_test_props() -> Result<PlanProperties> {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let ordering = [PhysicalSortExpr::new(
+            datafusion::physical_plan::expressions::col("a", &schema)?,
+            SortOptions::new(false, false),
+        )]
+        .into();
+        let partitioning = Partitioning::Range(RangePartitioning::try_new(
+            ordering,
+            vec![
+                SplitPoint::new(vec![ScalarValue::Int32(Some(10))]),
+                SplitPoint::new(vec![ScalarValue::Int32(Some(20))]),
+            ],
+        )?);
+
+        Ok(PlanProperties::new(
+            EquivalenceProperties::new(schema),
+            partitioning,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ))
+    }
+
+    unsafe extern "C" fn invalid_range_output_partitioning(
+        _props: &FFI_PlanProperties,
+    ) -> FFI_Partitioning {
+        FFI_Partitioning::Range(
+            std::iter::empty::<FFI_PhysicalSortExpr>().collect(),
+            std::iter::empty().collect(),
+        )
     }
 
     #[test]
@@ -311,6 +347,39 @@ mod tests {
         ffi_plan.library_marker_id = crate::mock_foreign_marker_id;
         let foreign_plan: PlanProperties = ffi_plan.try_into()?;
         assert_eq!(format!("{foreign_plan:?}"), format!("{props:?}"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ffi_plan_properties_preserves_range_partitioning() -> Result<()> {
+        let original_props = create_range_test_props()?;
+
+        let mut ffi_plan = FFI_PlanProperties::from(&original_props);
+        ffi_plan.library_marker_id = crate::mock_foreign_marker_id;
+        let foreign_plan: PlanProperties = ffi_plan.try_into()?;
+
+        assert_eq!(
+            foreign_plan.output_partitioning(),
+            original_props.output_partitioning()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ffi_plan_properties_rejects_invalid_range_partitioning() -> Result<()> {
+        let original_props = create_range_test_props()?;
+
+        let mut ffi_plan = FFI_PlanProperties::from(&original_props);
+        ffi_plan.library_marker_id = crate::mock_foreign_marker_id;
+        ffi_plan.output_partitioning = invalid_range_output_partitioning;
+
+        let error = PlanProperties::try_from(ffi_plan).unwrap_err().to_string();
+        assert!(
+            error.contains("Range partitioning requires non-empty ordering"),
+            "actual: {error}"
+        );
 
         Ok(())
     }
