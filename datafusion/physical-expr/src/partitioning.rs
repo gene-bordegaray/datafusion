@@ -20,9 +20,12 @@
 use crate::{
     EquivalenceProperties, PhysicalExpr, equivalence::ProjectionMapping,
     expressions::UnKnownColumn, physical_exprs_equal,
+    physical_exprs_equal_with_equivalence,
 };
 use datafusion_common::{Result, ScalarValue, plan_err};
-use datafusion_physical_expr_common::physical_expr::format_physical_expr_list;
+use datafusion_physical_expr_common::physical_expr::{
+    PhysicalExprRef, format_physical_expr_list,
+};
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use std::cmp::Ordering;
 use std::fmt;
@@ -325,7 +328,7 @@ impl RangePartitioning {
             .map(|sort_expr| Arc::clone(&sort_expr.expr))
             .collect::<Vec<_>>();
 
-        equivalent_exprs(&left_exprs, &right_exprs, eq_properties)
+        physical_exprs_equal_with_equivalence(&left_exprs, &right_exprs, eq_properties)
     }
 
     /// Calculates the range partitioning after applying the given projection.
@@ -464,37 +467,6 @@ fn compare_scalar_values_for_sort(
     }
 }
 
-fn equivalent_exprs(
-    left: &[Arc<dyn PhysicalExpr>],
-    right: &[Arc<dyn PhysicalExpr>],
-    eq_properties: &EquivalenceProperties,
-) -> bool {
-    if physical_exprs_equal(left, right) {
-        return true;
-    }
-
-    let eq_groups = eq_properties.eq_group();
-    if eq_groups.is_empty() {
-        return false;
-    }
-
-    let normalized_left = normalize_exprs(left, eq_properties);
-    let normalized_right = normalize_exprs(right, eq_properties);
-
-    physical_exprs_equal(&normalized_left, &normalized_right)
-}
-
-fn normalize_exprs(
-    exprs: &[Arc<dyn PhysicalExpr>],
-    eq_properties: &EquivalenceProperties,
-) -> Vec<Arc<dyn PhysicalExpr>> {
-    let eq_groups = eq_properties.eq_group();
-    exprs
-        .iter()
-        .map(|expr| eq_groups.normalize_expr(Arc::clone(expr)))
-        .collect()
-}
-
 /// Represents how a [`Partitioning`] satisfies a [`Distribution`] requirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartitioningSatisfaction {
@@ -553,7 +525,11 @@ impl Partitioning {
                 if left_exprs.is_empty() || right_exprs.is_empty() {
                     return false;
                 }
-                equivalent_exprs(left_exprs, right_exprs, eq_properties)
+                physical_exprs_equal_with_equivalence(
+                    left_exprs,
+                    right_exprs,
+                    eq_properties,
+                )
             }
             (Partitioning::Range(left), Partitioning::Range(right)) => {
                 left.compatible_with(right, eq_properties)
@@ -618,17 +594,23 @@ impl Partitioning {
                         return PartitioningSatisfaction::NotSatisfied;
                     }
 
-                    if equivalent_exprs(required_exprs, partition_exprs, eq_properties) {
+                    if physical_exprs_equal_with_equivalence(
+                        required_exprs,
+                        partition_exprs,
+                        eq_properties,
+                    ) {
                         return PartitioningSatisfaction::Exact;
                     }
 
                     let eq_groups = eq_properties.eq_group();
                     if !eq_groups.is_empty() {
                         if allow_subset {
-                            let normalized_partition_exprs =
-                                normalize_exprs(partition_exprs, eq_properties);
-                            let normalized_required_exprs =
-                                normalize_exprs(required_exprs, eq_properties);
+                            let normalized_partition_exprs = eq_groups
+                                .normalize_exprs(partition_exprs.iter().map(Arc::clone))
+                                .collect::<Vec<_>>();
+                            let normalized_required_exprs = eq_groups
+                                .normalize_exprs(required_exprs.iter().map(Arc::clone))
+                                .collect::<Vec<_>>();
                             if Self::is_subset_partitioning(
                                 &normalized_partition_exprs,
                                 &normalized_required_exprs,
@@ -742,6 +724,100 @@ impl Display for Distribution {
                 write!(f, "HashPartitioned[{}])", format_physical_expr_list(exprs))
             }
         }
+    }
+}
+
+/// Describes the distribution required from an [`ExecutionPlan`]'s children.
+#[derive(Debug, Clone)]
+pub enum InputDistributionRequirement {
+    /// Per-child requirements checked independently.
+    Independent(Vec<Distribution>),
+    /// Requirements involving relationships between child partitioning schemes.
+    Pairwise(PairwiseDistributionRequirement),
+}
+
+impl InputDistributionRequirement {
+    /// Returns the per-child fallback distributions for this requirement.
+    ///
+    /// Pairwise requirements use these distributions when the existing child
+    /// partitioning schemes do not satisfy the pairwise relationship.
+    pub fn per_child_distributions(&self) -> Vec<Distribution> {
+        match self {
+            Self::Independent(distribution) => distribution.clone(),
+            Self::Pairwise(requirement) => requirement.fallback_distribution(),
+        }
+    }
+}
+
+/// Describes distribution requirements involving multiple children.
+#[derive(Debug, Clone)]
+pub enum PairwiseDistributionRequirement {
+    /// Corresponding input partitions must be pairwise compatible.
+    ///
+    /// Partition `i` from each input must cover compatible domains for the
+    /// paired expressions, so an operator can consume matching partition pairs
+    /// without adding fallback repartitions.
+    CoPartitioned {
+        /// Left-side partitioning expressions.
+        left_exprs: Vec<PhysicalExprRef>,
+        /// Right-side partitioning expressions.
+        right_exprs: Vec<PhysicalExprRef>,
+        /// Partitioning modes that can satisfy this requirement.
+        accepted: PartitioningCompatibilitySet,
+    },
+}
+
+impl PairwiseDistributionRequirement {
+    /// Returns the per-child distributions to enforce when this pairwise
+    /// requirement is not already satisfied.
+    pub fn fallback_distribution(&self) -> Vec<Distribution> {
+        match self {
+            Self::CoPartitioned {
+                left_exprs,
+                right_exprs,
+                ..
+            } => vec![
+                Distribution::HashPartitioned(left_exprs.clone()),
+                Distribution::HashPartitioned(right_exprs.clone()),
+            ],
+        }
+    }
+}
+
+/// Partitioning modes that can satisfy a pairwise distribution requirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PartitioningCompatibility {
+    /// Hash partitioning on compatible expressions.
+    ///
+    /// Single-partition inputs also satisfy hash compatibility.
+    Hash,
+    /// Range partitioning on compatible expressions and split points.
+    Range,
+}
+
+/// Set of partitioning modes accepted by a pairwise distribution requirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitioningCompatibilitySet(u8);
+
+impl PartitioningCompatibilitySet {
+    const HASH_BIT: u8 = 0b01;
+    const RANGE_BIT: u8 = 0b10;
+
+    /// Accepts hash-compatible partitioning.
+    pub const HASH: Self = Self(Self::HASH_BIT);
+    /// Accepts range-compatible partitioning.
+    pub const RANGE: Self = Self(Self::RANGE_BIT);
+    /// Accepts hash-compatible or range-compatible partitioning.
+    pub const HASH_OR_RANGE: Self = Self(Self::HASH_BIT | Self::RANGE_BIT);
+
+    /// Returns true if this set contains `compatibility`.
+    pub fn contains(self, compatibility: PartitioningCompatibility) -> bool {
+        let bit = match compatibility {
+            PartitioningCompatibility::Hash => Self::HASH_BIT,
+            PartitioningCompatibility::Range => Self::RANGE_BIT,
+        };
+        self.0 & bit != 0
     }
 }
 

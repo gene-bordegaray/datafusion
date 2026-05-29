@@ -507,11 +507,11 @@ impl ExecutionPlan for PiecewiseMergeJoinExec {
         vec![&self.buffered, &self.streamed]
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![
+    fn input_distribution_requirement(&self) -> crate::InputDistributionRequirement {
+        crate::InputDistributionRequirement::Independent(vec![
             Distribution::SinglePartition,
             Distribution::UnspecifiedDistribution,
-        ]
+        ])
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {

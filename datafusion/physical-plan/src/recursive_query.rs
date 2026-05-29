@@ -164,11 +164,11 @@ impl ExecutionPlan for RecursiveQueryExec {
         vec![false, false]
     }
 
-    fn required_input_distribution(&self) -> Vec<crate::Distribution> {
-        vec![
+    fn input_distribution_requirement(&self) -> crate::InputDistributionRequirement {
+        crate::InputDistributionRequirement::Independent(vec![
             crate::Distribution::SinglePartition,
             crate::Distribution::SinglePartition,
-        ]
+        ])
     }
 
     fn with_new_children(

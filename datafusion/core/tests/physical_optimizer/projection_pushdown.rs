@@ -800,7 +800,8 @@ fn test_output_req_after_projection() -> Result<()> {
     if let Distribution::HashPartitioned(vec) = after_optimize
         .downcast_ref::<OutputRequirementExec>()
         .unwrap()
-        .required_input_distribution()[0]
+        .input_distribution_requirement()
+        .per_child_distributions()[0]
         .clone()
     {
         assert!(

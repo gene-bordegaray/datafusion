@@ -54,8 +54,9 @@ use crate::projection::{
 use crate::repartition::REPARTITION_RANDOM_STATE;
 use crate::spill::get_record_batch_memory_size;
 use crate::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
-    PlanProperties, SendableRecordBatchStream, Statistics,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+    InputDistributionRequirement, PairwiseDistributionRequirement, Partitioning,
+    PartitioningCompatibilitySet, PlanProperties, SendableRecordBatchStream, Statistics,
     common::can_project,
     joins::utils::{
         BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinHashMapType,
@@ -857,6 +858,17 @@ impl HashJoinExec {
             return false;
         }
 
+        // Partitioned dynamic filters route probe rows to build-side filter
+        // fragments with the hash repartitioning function. Range-compatible
+        // partitioned joins do not use hash routing, so keep the filter global
+        // until range-aware dynamic filters are implemented.
+        if self.mode == PartitionMode::Partitioned
+            && (matches!(self.left.output_partitioning(), Partitioning::Range(_))
+                || matches!(self.right.output_partitioning(), Partitioning::Range(_)))
+        {
+            return false;
+        }
+
         true
     }
 
@@ -1202,27 +1214,32 @@ impl ExecutionPlan for HashJoinExec {
         &self.cache
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
+    fn input_distribution_requirement(&self) -> InputDistributionRequirement {
         match self.mode {
-            PartitionMode::CollectLeft => vec![
-                Distribution::SinglePartition,
-                Distribution::UnspecifiedDistribution,
-            ],
             PartitionMode::Partitioned => {
-                let (left_expr, right_expr) = self
+                let (left_keys, right_keys) = self
                     .on
                     .iter()
                     .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
                     .unzip();
-                vec![
-                    Distribution::HashPartitioned(left_expr),
-                    Distribution::HashPartitioned(right_expr),
-                ]
+                InputDistributionRequirement::Pairwise(
+                    PairwiseDistributionRequirement::CoPartitioned {
+                        left_exprs: left_keys,
+                        right_exprs: right_keys,
+                        accepted: PartitioningCompatibilitySet::HASH_OR_RANGE,
+                    },
+                )
             }
-            PartitionMode::Auto => vec![
+            PartitionMode::CollectLeft => {
+                InputDistributionRequirement::Independent(vec![
+                    Distribution::SinglePartition,
+                    Distribution::UnspecifiedDistribution,
+                ])
+            }
+            PartitionMode::Auto => InputDistributionRequirement::Independent(vec![
                 Distribution::UnspecifiedDistribution,
                 Distribution::UnspecifiedDistribution,
-            ],
+            ]),
         }
     }
 

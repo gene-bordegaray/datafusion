@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use crate::equivalence::EquivalenceProperties;
 use crate::expressions::{self, Column};
 use crate::{LexOrdering, PhysicalSortExpr, create_physical_expr};
 
@@ -67,6 +68,32 @@ pub fn physical_exprs_equal(
     rhs: &[Arc<dyn PhysicalExpr>],
 ) -> bool {
     lhs.len() == rhs.len() && izip!(lhs, rhs).all(|(lhs, rhs)| lhs.eq(rhs))
+}
+
+/// Checks whether the given physical expression slices are equal after
+/// normalizing through equivalence properties.
+pub fn physical_exprs_equal_with_equivalence(
+    lhs: &[Arc<dyn PhysicalExpr>],
+    rhs: &[Arc<dyn PhysicalExpr>],
+    eq_properties: &EquivalenceProperties,
+) -> bool {
+    if physical_exprs_equal(lhs, rhs) {
+        return true;
+    }
+
+    let eq_groups = eq_properties.eq_group();
+    if eq_groups.is_empty() {
+        return false;
+    }
+
+    let normalized_lhs = eq_groups
+        .normalize_exprs(lhs.iter().map(Arc::clone))
+        .collect::<Vec<_>>();
+    let normalized_rhs = eq_groups
+        .normalize_exprs(rhs.iter().map(Arc::clone))
+        .collect::<Vec<_>>();
+
+    physical_exprs_equal(&normalized_lhs, &normalized_rhs)
 }
 
 /// Checks whether the given physical expression slices are equal in the sense

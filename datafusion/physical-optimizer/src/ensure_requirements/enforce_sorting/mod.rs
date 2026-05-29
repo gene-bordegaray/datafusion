@@ -173,14 +173,15 @@ fn update_coalesce_ctx_children(
         // Initiate a connection:
         true
     } else {
+        let required_distributions = coalesce_context
+            .plan
+            .input_distribution_requirement()
+            .per_child_distributions();
         children.iter().enumerate().any(|(idx, node)| {
             // Only consider operators that don't require a single partition,
             // and connected to some `CoalescePartitionsExec`:
             node.data
-                && !matches!(
-                    coalesce_context.plan.required_input_distribution()[idx],
-                    Distribution::SinglePartition
-                )
+                && !matches!(required_distributions[idx], Distribution::SinglePartition)
         })
     };
 }
@@ -535,13 +536,18 @@ fn analyze_immediate_sort_removal(
 fn adjust_window_sort_removal(
     mut window_tree: PlanWithCorrespondingSort,
 ) -> Result<PlanWithCorrespondingSort> {
+    let requires_single_partition = matches!(
+        window_tree
+            .plan
+            .input_distribution_requirement()
+            .per_child_distributions()[0],
+        Distribution::SinglePartition
+    );
+
     // Window operators have a single child we need to adjust:
     let child_node = remove_corresponding_sort_from_sub_plan(
         window_tree.children.swap_remove(0),
-        matches!(
-            window_tree.plan.required_input_distribution()[0],
-            Distribution::SinglePartition
-        ),
+        requires_single_partition,
     )?;
     window_tree.children.push(child_node);
 
@@ -653,8 +659,11 @@ fn update_child_to_remove_unnecessary_sort(
     parent: &Arc<dyn ExecutionPlan>,
 ) -> Result<PlanWithCorrespondingSort> {
     if node.data {
+        let required_distributions = parent
+            .input_distribution_requirement()
+            .per_child_distributions();
         let requires_single_partition = matches!(
-            parent.required_input_distribution()[child_idx],
+            required_distributions[child_idx],
             Distribution::SinglePartition
         );
         node = remove_corresponding_sort_from_sub_plan(node, requires_single_partition)?;
@@ -676,7 +685,10 @@ fn remove_corresponding_sort_from_sub_plan(
         }
     } else {
         let mut any_connection = false;
-        let required_dist = node.plan.required_input_distribution();
+        let required_dist = node
+            .plan
+            .input_distribution_requirement()
+            .per_child_distributions();
         node.children = node
             .children
             .into_iter()

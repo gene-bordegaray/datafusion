@@ -239,12 +239,14 @@ impl ExecutionPlan for WindowAggExec {
         }
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        if self.partition_keys().is_empty() {
-            vec![Distribution::SinglePartition]
-        } else {
-            vec![Distribution::HashPartitioned(self.partition_keys())]
-        }
+    fn input_distribution_requirement(&self) -> crate::InputDistributionRequirement {
+        crate::InputDistributionRequirement::Independent(
+            if self.partition_keys().is_empty() {
+                vec![Distribution::SinglePartition]
+            } else {
+                vec![Distribution::HashPartitioned(self.partition_keys())]
+            },
+        )
     }
 
     fn with_new_children(

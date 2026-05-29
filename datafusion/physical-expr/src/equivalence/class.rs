@@ -523,6 +523,16 @@ impl EquivalenceGroup {
         // The unwrap above is safe because the closure always returns `Ok`.
     }
 
+    /// Normalizes the given physical expressions according to this group. The
+    /// expression is replaced with the first (canonical) expression in the
+    /// equivalence class it matches with (if any).
+    pub fn normalize_exprs<'a>(
+        &'a self,
+        exprs: impl IntoIterator<Item = Arc<dyn PhysicalExpr>> + 'a,
+    ) -> impl Iterator<Item = Arc<dyn PhysicalExpr>> + 'a {
+        exprs.into_iter().map(|expr| self.normalize_expr(expr))
+    }
+
     /// Normalizes the given sort expression according to this group. The
     /// underlying physical expression is replaced with the first expression in
     /// the equivalence class it matches with (if any). If the underlying

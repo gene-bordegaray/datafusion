@@ -1543,8 +1543,8 @@ impl ExecutionPlan for AggregateExec {
         &self.cache
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        match &self.mode {
+    fn input_distribution_requirement(&self) -> crate::InputDistributionRequirement {
+        crate::InputDistributionRequirement::Independent(match &self.mode {
             AggregateMode::Partial | AggregateMode::PartialReduce => {
                 vec![Distribution::UnspecifiedDistribution]
             }
@@ -1554,7 +1554,7 @@ impl ExecutionPlan for AggregateExec {
             AggregateMode::Final | AggregateMode::Single => {
                 vec![Distribution::SinglePartition]
             }
-        }
+        })
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {

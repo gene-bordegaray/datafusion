@@ -37,10 +37,10 @@ use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::{CsvSource, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_common::ScalarValue;
 use datafusion_common::config::CsvOptions;
 use datafusion_common::error::Result;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion_common::{NullEquality, ScalarValue};
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_expr::{JoinType, Operator};
@@ -59,18 +59,24 @@ use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, PhysicalGroupBy,
 };
 
-use datafusion_physical_expr::Distribution;
+use datafusion_physical_expr::{
+    Distribution, EquivalenceProperties, InputDistributionRequirement,
+};
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion_physical_plan::execution_plan::ExecutionPlan;
+use datafusion_physical_plan::execution_plan::{
+    Boundedness, EmissionType, ExecutionPlan,
+};
 use datafusion_physical_plan::expressions::col;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::utils::JoinOn;
+use datafusion_physical_plan::joins::{StreamJoinPartitionMode, SymmetricHashJoinExec};
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties, displayable,
+    DisplayAs, DisplayFormatType, ExecutionPlanProperties, Partitioning, PlanProperties,
+    RangePartitioning, SplitPoint, displayable,
 };
 use insta::Settings;
 
@@ -263,8 +269,8 @@ impl ExecutionPlan for SinglePartitionMaintainsOrderExec {
         vec![&self.input]
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+    fn input_distribution_requirement(&self) -> InputDistributionRequirement {
+        InputDistributionRequirement::Independent(vec![Distribution::SinglePartition])
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -297,6 +303,97 @@ fn single_partition_maintains_order_exec(
     input: Arc<dyn ExecutionPlan>,
 ) -> Arc<dyn ExecutionPlan> {
     Arc::new(SinglePartitionMaintainsOrderExec::new(input))
+}
+
+#[derive(Debug)]
+struct PartitionedExec {
+    name: &'static str,
+    cache: Arc<PlanProperties>,
+}
+
+impl PartitionedExec {
+    fn new(name: &'static str, partitioning: Partitioning) -> Self {
+        let cache = PlanProperties::new(
+            EquivalenceProperties::new(schema()),
+            partitioning,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+
+        Self {
+            name,
+            cache: Arc::new(cache),
+        }
+    }
+}
+
+impl DisplayAs for PartitionedExec {
+    fn fmt_as(
+        &self,
+        t: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "{}: output_partitioning={}",
+                    self.name,
+                    self.cache.output_partitioning()
+                )
+            }
+            DisplayFormatType::TreeRender => write!(f, ""),
+        }
+    }
+}
+
+impl ExecutionPlan for PartitionedExec {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.cache
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        assert!(children.is_empty());
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<datafusion::execution::context::TaskContext>,
+    ) -> Result<datafusion_physical_plan::SendableRecordBatchStream> {
+        unreachable!();
+    }
+}
+
+fn range_partitioned_exec(
+    column: &str,
+    split_points: Vec<SplitPoint>,
+) -> Arc<dyn ExecutionPlan> {
+    let schema = schema();
+    let ordering =
+        LexOrdering::new([PhysicalSortExpr::new_default(col(column, &schema).unwrap())])
+            .unwrap();
+    let partitioning =
+        Partitioning::Range(RangePartitioning::try_new(ordering, split_points).unwrap());
+    Arc::new(PartitionedExec::new("RangePartitionedExec", partitioning))
+}
+
+fn hash_partitioned_exec(column: &str, partition_count: usize) -> Arc<dyn ExecutionPlan> {
+    let partitioning =
+        Partitioning::Hash(vec![col(column, &schema()).unwrap()], partition_count);
+    Arc::new(PartitionedExec::new("HashPartitionedExec", partitioning))
 }
 
 fn parquet_exec() -> Arc<DataSourceExec> {
@@ -696,6 +793,151 @@ impl TestConfig {
     ) -> Arc<dyn ExecutionPlan> {
         self.try_to_plan(plan, optimizers_to_run).unwrap()
     }
+}
+
+#[test]
+fn range_partitioned_hash_join_avoids_hash_repartition_when_compatible() {
+    let split_points = vec![SplitPoint::new(vec![ScalarValue::Int64(Some(10))])];
+    let left = range_partitioned_exec("a", split_points.clone());
+    let right = range_partitioned_exec("b", split_points);
+    let join_on = vec![(
+        Arc::new(Column::new_with_schema("a", &left.schema()).unwrap()) as _,
+        Arc::new(Column::new_with_schema("b", &right.schema()).unwrap()) as _,
+    )];
+    let join = hash_join_exec(left, right, &join_on, &JoinType::Inner);
+
+    let plan = TestConfig::default().to_plan(join, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, b@1)]
+      RangePartitionedExec: output_partitioning=Range([a@0 ASC], [(10)], 2)
+      RangePartitionedExec: output_partitioning=Range([b@1 ASC], [(10)], 2)
+    "
+    );
+}
+
+#[test]
+fn range_partitioned_hash_join_repartitions_when_incompatible() {
+    let left = range_partitioned_exec(
+        "a",
+        vec![SplitPoint::new(vec![ScalarValue::Int64(Some(10))])],
+    );
+    let right = range_partitioned_exec(
+        "b",
+        vec![SplitPoint::new(vec![ScalarValue::Int64(Some(20))])],
+    );
+    let join_on = vec![(
+        Arc::new(Column::new_with_schema("a", &left.schema()).unwrap()) as _,
+        Arc::new(Column::new_with_schema("b", &right.schema()).unwrap()) as _,
+    )];
+    let join = hash_join_exec(left, right, &join_on, &JoinType::Inner);
+
+    let plan = TestConfig::default().to_plan(join, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, b@1)]
+      RepartitionExec: partitioning=Hash([a@0], 10), input_partitions=2
+        RangePartitionedExec: output_partitioning=Range([a@0 ASC], [(10)], 2)
+      RepartitionExec: partitioning=Hash([b@1], 10), input_partitions=2
+        RangePartitionedExec: output_partitioning=Range([b@1 ASC], [(20)], 2)
+    "
+    );
+}
+
+#[test]
+fn hash_join_repartitions_mixed_range_and_hash_partitioning() {
+    let left = range_partitioned_exec(
+        "a",
+        vec![SplitPoint::new(vec![ScalarValue::Int64(Some(10))])],
+    );
+    let right = hash_partitioned_exec("b", 2);
+    let join_on = vec![(
+        Arc::new(Column::new_with_schema("a", &left.schema()).unwrap()) as _,
+        Arc::new(Column::new_with_schema("b", &right.schema()).unwrap()) as _,
+    )];
+    let join = hash_join_exec(left, right, &join_on, &JoinType::Inner);
+
+    let plan = TestConfig::default().to_plan(join, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, b@1)]
+      RepartitionExec: partitioning=Hash([a@0], 10), input_partitions=2
+        RangePartitionedExec: output_partitioning=Range([a@0 ASC], [(10)], 2)
+      RepartitionExec: partitioning=Hash([b@1], 10), input_partitions=2
+        HashPartitionedExec: output_partitioning=Hash([b@1], 2)
+    "
+    );
+}
+
+#[test]
+fn range_partitioned_sort_merge_join_uses_hash_repartition() {
+    let split_points = vec![SplitPoint::new(vec![ScalarValue::Int64(Some(10))])];
+    let left = range_partitioned_exec("a", split_points.clone());
+    let right = range_partitioned_exec("b", split_points);
+    let join_on = vec![(
+        Arc::new(Column::new_with_schema("a", &left.schema()).unwrap()) as _,
+        Arc::new(Column::new_with_schema("b", &right.schema()).unwrap()) as _,
+    )];
+    let join = sort_merge_join_exec(left, right, &join_on, &JoinType::Inner);
+
+    let plan = TestConfig::default().to_plan(join, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    SortMergeJoinExec: join_type=Inner, on=[(a@0, b@1)]
+      SortExec: expr=[a@0 ASC], preserve_partitioning=[true]
+        RepartitionExec: partitioning=Hash([a@0], 10), input_partitions=2
+          RangePartitionedExec: output_partitioning=Range([a@0 ASC], [(10)], 2)
+      SortExec: expr=[b@1 ASC], preserve_partitioning=[true]
+        RepartitionExec: partitioning=Hash([b@1], 10), input_partitions=2
+          RangePartitionedExec: output_partitioning=Range([b@1 ASC], [(10)], 2)
+    "
+    );
+}
+
+#[test]
+fn range_partitioned_symmetric_hash_join_uses_hash_repartition() {
+    let split_points = vec![SplitPoint::new(vec![ScalarValue::Int64(Some(10))])];
+    let left = range_partitioned_exec("a", split_points.clone());
+    let right = range_partitioned_exec("b", split_points);
+    let join_on = vec![(
+        Arc::new(Column::new_with_schema("a", &left.schema()).unwrap()) as _,
+        Arc::new(Column::new_with_schema("b", &right.schema()).unwrap()) as _,
+    )];
+    let join = Arc::new(
+        SymmetricHashJoinExec::try_new(
+            left,
+            right,
+            join_on,
+            None,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+            None,
+            None,
+            StreamJoinPartitionMode::Partitioned,
+        )
+        .unwrap(),
+    );
+
+    let plan = TestConfig::default().to_plan(join, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    SymmetricHashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, b@1)]
+      RepartitionExec: partitioning=Hash([a@0], 10), input_partitions=2
+        RangePartitionedExec: output_partitioning=Range([a@0 ASC], [(10)], 2)
+      RepartitionExec: partitioning=Hash([b@1], 10), input_partitions=2
+        RangePartitionedExec: output_partitioning=Range([b@1 ASC], [(10)], 2)
+    "
+    );
 }
 
 #[test]

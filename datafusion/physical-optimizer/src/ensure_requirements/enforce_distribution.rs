@@ -47,7 +47,8 @@ use datafusion_expr::logical_plan::{Aggregate, JoinType};
 use datafusion_physical_expr::expressions::{Column, NoOp};
 use datafusion_physical_expr::utils::map_columns_before_projection;
 use datafusion_physical_expr::{
-    EquivalenceProperties, PhysicalExpr, PhysicalExprRef, physical_exprs_equal,
+    EquivalenceProperties, InputDistributionRequirement, PairwiseDistributionRequirement,
+    PhysicalExpr, PhysicalExprRef, physical_exprs_equal,
 };
 use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::aggregates::{
@@ -55,6 +56,7 @@ use datafusion_physical_plan::aggregates::{
 };
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::execution_plan::EmissionType;
+use datafusion_physical_plan::joins::utils::pairwise_partitioning_compatibility;
 use datafusion_physical_plan::joins::{
     CrossJoinExec, HashJoinExec, PartitionMode, SortMergeJoinExec,
 };
@@ -565,21 +567,16 @@ fn try_reorder(
     {
         return (join_keys, Some(vec![]));
     } else if !equivalence_properties.eq_group().is_empty() {
-        normalized_expected = expected
-            .iter()
-            .map(|e| eq_groups.normalize_expr(Arc::clone(e)))
+        normalized_expected = eq_groups
+            .normalize_exprs(expected.iter().map(Arc::clone))
             .collect();
 
-        normalized_left_keys = join_keys
-            .left_keys
-            .iter()
-            .map(|e| eq_groups.normalize_expr(Arc::clone(e)))
+        normalized_left_keys = eq_groups
+            .normalize_exprs(join_keys.left_keys.iter().map(Arc::clone))
             .collect();
 
-        normalized_right_keys = join_keys
-            .right_keys
-            .iter()
-            .map(|e| eq_groups.normalize_expr(Arc::clone(e)))
+        normalized_right_keys = eq_groups
+            .normalize_exprs(join_keys.right_keys.iter().map(Arc::clone))
             .collect();
 
         if physical_exprs_equal(&normalized_expected, &normalized_left_keys)
@@ -1002,13 +999,18 @@ struct RepartitionRequirementStatus {
 /// ```
 fn get_repartition_requirement_status(
     plan: &Arc<dyn ExecutionPlan>,
+    input_distribution_requirement: &InputDistributionRequirement,
     batch_size: usize,
     should_use_estimates: bool,
 ) -> Result<Vec<RepartitionRequirementStatus>> {
     let mut needs_alignment = false;
     let children = plan.children();
     let rr_beneficial = plan.benefits_from_input_partitioning();
-    let requirements = plan.required_input_distribution();
+    let requirements = input_distribution_requirement.per_child_distributions();
+    let pairwise_requirement_satisfied = pairwise_distribution_requirement_satisfied(
+        plan,
+        input_distribution_requirement,
+    )?;
     let mut repartition_status_flags = vec![];
     for (child, requirement, roundrobin_beneficial) in
         izip!(children.into_iter(), requirements, rr_beneficial)
@@ -1022,18 +1024,19 @@ fn get_repartition_requirement_status(
             Precision::Absent => true,
         };
         let is_hash = matches!(requirement, Distribution::HashPartitioned(_));
+        let hash_required = is_hash && !pairwise_requirement_satisfied;
         // Hash re-partitioning is necessary when the input has more than one
         // partitions:
         let multi_partitions = child.output_partitioning().partition_count() > 1;
         let roundrobin_sensible = roundrobin_beneficial && roundrobin_beneficial_stats;
-        needs_alignment |= is_hash && (multi_partitions || roundrobin_sensible);
+        needs_alignment |= hash_required && (multi_partitions || roundrobin_sensible);
         repartition_status_flags.push((
             is_hash,
             RepartitionRequirementStatus {
                 requirement,
                 roundrobin_beneficial,
                 roundrobin_beneficial_stats,
-                hash_necessary: is_hash && multi_partitions,
+                hash_necessary: hash_required && multi_partitions,
             },
         ));
     }
@@ -1049,10 +1052,49 @@ fn get_repartition_requirement_status(
             }
         }
     }
+
     Ok(repartition_status_flags
         .into_iter()
         .map(|(_, status)| status)
         .collect())
+}
+
+fn pairwise_distribution_requirement_satisfied(
+    plan: &Arc<dyn ExecutionPlan>,
+    input_distribution_requirement: &InputDistributionRequirement,
+) -> Result<bool> {
+    let InputDistributionRequirement::Pairwise(
+        PairwiseDistributionRequirement::CoPartitioned {
+            left_exprs,
+            right_exprs,
+            accepted,
+        },
+    ) = input_distribution_requirement
+    else {
+        return Ok(false);
+    };
+
+    let children = plan.children();
+    let [left, right] = children.as_slice() else {
+        return Ok(false);
+    };
+
+    // Single-partition inputs are executable without repartitioning, but hash
+    // repartitioning may still be beneficial to increase join parallelism.
+    if left.output_partitioning().partition_count() == 1
+        && right.output_partitioning().partition_count() == 1
+    {
+        return Ok(false);
+    }
+
+    Ok(pairwise_partitioning_compatibility(
+        left,
+        right,
+        left_exprs,
+        right_exprs,
+        *accepted,
+    )?
+    .is_some())
 }
 
 /// This function checks whether we need to add additional data exchange
@@ -1153,13 +1195,20 @@ pub fn ensure_distribution(
     //
     // CollectLeft/CollectRight modes are safe because one side is collected
     // to a single partition which eliminates partition-to-partition mapping.
-    let is_partitioned_join = plan
-        .downcast_ref::<HashJoinExec>()
-        .is_some_and(|join| join.mode == PartitionMode::Partitioned)
-        || plan.is::<SortMergeJoinExec>();
+    let input_distribution_requirement = plan.input_distribution_requirement();
+    let is_partitioned_join = matches!(
+        &input_distribution_requirement,
+        InputDistributionRequirement::Pairwise(
+            PairwiseDistributionRequirement::CoPartitioned { .. }
+        )
+    );
 
-    let repartition_status_flags =
-        get_repartition_requirement_status(&plan, batch_size, should_use_estimates)?;
+    let repartition_status_flags = get_repartition_requirement_status(
+        &plan,
+        &input_distribution_requirement,
+        batch_size,
+        should_use_estimates,
+    )?;
     // This loop iterates over all the children to:
     // - Increase parallelism for every child if it is beneficial.
     // - Satisfy the distribution requirements of every child, if it is not
@@ -1403,7 +1452,8 @@ fn update_children(mut dist_context: DistributionContext) -> Result<Distribution
                 || child_context.children[0].data
                 || child_context
                     .plan
-                    .required_input_distribution()
+                    .input_distribution_requirement()
+                    .per_child_distributions()
                     .iter()
                     .zip(child_context.children.iter())
                     .any(|(required_dist, child_context)| {

@@ -39,8 +39,10 @@ use crate::projection::{
 };
 use crate::spill::spill_manager::SpillManager;
 use crate::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
-    PlanProperties, SendableRecordBatchStream, Statistics, check_if_same_properties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
+    InputDistributionRequirement, PairwiseDistributionRequirement,
+    PartitioningCompatibilitySet, PlanProperties, SendableRecordBatchStream, Statistics,
+    check_if_same_properties,
 };
 
 use arrow::compute::SortOptions;
@@ -422,16 +424,19 @@ impl ExecutionPlan for SortMergeJoinExec {
         &self.cache
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        let (left_expr, right_expr) = self
+    fn input_distribution_requirement(&self) -> InputDistributionRequirement {
+        let (left_keys, right_keys) = self
             .on
             .iter()
             .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
             .unzip();
-        vec![
-            Distribution::HashPartitioned(left_expr),
-            Distribution::HashPartitioned(right_expr),
-        ]
+        InputDistributionRequirement::Pairwise(
+            PairwiseDistributionRequirement::CoPartitioned {
+                left_exprs: left_keys,
+                right_exprs: right_keys,
+                accepted: PartitioningCompatibilitySet::HASH,
+            },
+        )
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {

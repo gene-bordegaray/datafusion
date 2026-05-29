@@ -30,7 +30,7 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Result, Statistics};
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::Distribution;
+use datafusion_physical_expr::{Distribution, InputDistributionRequirement};
 use datafusion_physical_expr_common::sort_expr::OrderingRequirements;
 use datafusion_physical_plan::execution_plan::Boundedness;
 use datafusion_physical_plan::projection::{
@@ -204,8 +204,8 @@ impl ExecutionPlan for OutputRequirementExec {
         vec![false]
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![self.dist_requirement.clone()]
+    fn input_distribution_requirement(&self) -> InputDistributionRequirement {
+        InputDistributionRequirement::Independent(vec![self.dist_requirement.clone()])
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -268,7 +268,10 @@ impl ExecutionPlan for OutputRequirementExec {
             requirements = OrderingRequirements::new_alternatives(updated_reqs, soft);
         }
 
-        let dist_req = match &self.required_input_distribution()[0] {
+        let input_distribution = self
+            .input_distribution_requirement()
+            .per_child_distributions();
+        let dist_req = match &input_distribution[0] {
             Distribution::HashPartitioned(exprs) => {
                 let mut updated_exprs = vec![];
                 for expr in exprs {
@@ -355,7 +358,10 @@ fn require_top_ordering_helper(
         // In case of constant columns, output ordering of the `SortExec` would
         // be an empty set. Therefore; we check the sort expression field to
         // assign the requirements.
-        let req_dist = sort_exec.required_input_distribution().swap_remove(0);
+        let req_dist = sort_exec
+            .input_distribution_requirement()
+            .per_child_distributions()
+            .swap_remove(0);
         let req_ordering = sort_exec.expr();
         let reqs = OrderingRequirements::from(req_ordering.clone());
         let fetch = sort_exec.fetch();

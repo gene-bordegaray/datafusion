@@ -83,8 +83,9 @@ use datafusion::{
     optimizer::{OptimizerConfig, OptimizerRule},
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
-        PlanProperties, RecordBatchStream, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+        InputDistributionRequirement, Partitioning, PlanProperties, RecordBatchStream,
+        SendableRecordBatchStream,
     },
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
     prelude::{SessionConfig, SessionContext},
@@ -708,8 +709,8 @@ impl ExecutionPlan for TopKExec {
         &self.cache
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+    fn input_distribution_requirement(&self) -> InputDistributionRequirement {
+        InputDistributionRequirement::Independent(vec![Distribution::SinglePartition])
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

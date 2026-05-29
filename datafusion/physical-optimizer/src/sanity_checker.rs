@@ -30,8 +30,12 @@ use datafusion_common::config::{ConfigOptions, OptimizerOptions};
 use datafusion_common::plan_err;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_physical_expr::intervals::utils::{check_support, is_datatype_supported};
+use datafusion_physical_expr::{
+    InputDistributionRequirement, PairwiseDistributionRequirement,
+};
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::joins::SymmetricHashJoinExec;
+use datafusion_physical_plan::joins::utils::pairwise_partitioning_compatibility;
 use datafusion_physical_plan::{ExecutionPlanProperties, get_plan_string};
 
 use crate::PhysicalOptimizerRule;
@@ -142,10 +146,16 @@ pub fn check_plan_sanity(
 ) -> Result<()> {
     check_finiteness_requirements(plan.as_ref(), optimizer_options)?;
 
+    let input_distribution_requirement = plan.input_distribution_requirement();
+    let pairwise_requirement_satisfied = pairwise_distribution_requirement_satisfied(
+        plan,
+        &input_distribution_requirement,
+    )?;
+
     for ((idx, child), sort_req, dist_req) in izip!(
         plan.children().into_iter().enumerate(),
         plan.required_input_ordering(),
-        plan.required_input_distribution(),
+        input_distribution_requirement.per_child_distributions(),
     ) {
         let child_eq_props = child.equivalence_properties();
         if let Some(sort_req) = sort_req {
@@ -162,11 +172,13 @@ pub fn check_plan_sanity(
             }
         }
 
-        if !child
+        let distribution_satisfied = child
             .output_partitioning()
             .satisfaction(&dist_req, child_eq_props, true)
             .is_satisfied()
-        {
+            || pairwise_requirement_satisfied;
+
+        if !distribution_satisfied {
             let plan_str = get_plan_string(plan);
             return plan_err!(
                 "Plan: {:?} does not satisfy distribution requirements: {}. Child-{} output partitioning: {}",
@@ -179,6 +191,36 @@ pub fn check_plan_sanity(
     }
 
     Ok(())
+}
+
+fn pairwise_distribution_requirement_satisfied(
+    plan: &Arc<dyn ExecutionPlan>,
+    input_distribution_requirement: &InputDistributionRequirement,
+) -> Result<bool> {
+    let InputDistributionRequirement::Pairwise(
+        PairwiseDistributionRequirement::CoPartitioned {
+            left_exprs,
+            right_exprs,
+            accepted,
+        },
+    ) = &input_distribution_requirement
+    else {
+        return Ok(false);
+    };
+
+    let children = plan.children();
+    let [left, right] = children.as_slice() else {
+        return Ok(false);
+    };
+
+    Ok(pairwise_partitioning_compatibility(
+        left,
+        right,
+        left_exprs,
+        right_exprs,
+        *accepted,
+    )?
+    .is_some())
 }
 
 // See tests in datafusion/core/tests/physical_optimizer

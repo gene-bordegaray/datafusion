@@ -1136,15 +1136,15 @@ impl ExecutionPlan for SortExec {
         &self.cache
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        if self.preserve_partitioning {
+    fn input_distribution_requirement(&self) -> crate::InputDistributionRequirement {
+        crate::InputDistributionRequirement::Independent(if self.preserve_partitioning {
             vec![Distribution::UnspecifiedDistribution]
         } else {
             // global sort
             // TODO support range partitioning and OrderedDistribution.
             // See https://github.com/apache/datafusion/issues/22395
             vec![Distribution::SinglePartition]
-        }
+        })
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

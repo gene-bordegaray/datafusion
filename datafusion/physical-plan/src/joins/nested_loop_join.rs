@@ -564,11 +564,11 @@ impl ExecutionPlan for NestedLoopJoinExec {
         &self.cache
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![
+    fn input_distribution_requirement(&self) -> crate::InputDistributionRequirement {
+        crate::InputDistributionRequirement::Independent(vec![
             Distribution::SinglePartition,
             Distribution::UnspecifiedDistribution,
-        ]
+        ])
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {

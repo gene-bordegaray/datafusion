@@ -67,15 +67,17 @@ use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::stats::Precision;
 use datafusion_common::{
     DataFusionError, JoinSide, JoinType, NullEquality, Result, SharedResult,
-    not_impl_err, plan_err,
+    internal_err, not_impl_err, plan_err,
 };
 use datafusion_expr::Operator;
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{
-    LexOrdering, PhysicalExpr, PhysicalExprRef, add_offset_to_expr,
-    add_offset_to_physical_sort_exprs,
+    EquivalenceProperties, LexOrdering, PartitioningCompatibility,
+    PartitioningCompatibilitySet, PhysicalExpr, PhysicalExprRef, PhysicalSortExpr,
+    RangePartitioning, add_offset_to_expr, add_offset_to_physical_sort_exprs,
+    physical_exprs_equal_with_equivalence,
 };
 
 use datafusion_physical_expr_common::datum::compare_op_for_nested;
@@ -144,16 +146,147 @@ pub fn adjust_right_output_partitioning(
                 .collect::<Result<_>>()?;
             Partitioning::Hash(new_exprs, *size)
         }
-        Partitioning::Range(_) => {
-            // Range partitioning optimizer propagation is tracked in
-            // https://github.com/apache/datafusion/issues/22395
-            return not_impl_err!(
-                "Join output partitioning with range partitioning is not implemented"
-            );
+        Partitioning::Range(range) => {
+            let ordering = range
+                .ordering()
+                .iter()
+                .map(|sort_expr| {
+                    Ok(PhysicalSortExpr::new(
+                        add_offset_to_expr(
+                            Arc::clone(&sort_expr.expr),
+                            left_columns_len as _,
+                        )?,
+                        sort_expr.options,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let Some(ordering) = LexOrdering::new(ordering) else {
+                return internal_err!("Range partitioning ordering should not be empty");
+            };
+
+            Partitioning::Range(RangePartitioning::new(
+                ordering,
+                range.split_points().to_vec(),
+            ))
         }
         result => result.clone(),
     };
     Ok(result)
+}
+
+/// Returns true if two range-partitioned join inputs can be consumed
+/// partition-by-partition by a partitioned join.
+///
+/// The right range map is translated into the left input's expression space
+/// through the join keys before comparing. This is stricter than asking
+/// whether each input individually satisfies a hash distribution: partitioned
+/// joins require partition `i` from both sides to cover the same key domain.
+pub fn range_partitioned_join_inputs_compatible(
+    left: &Arc<dyn ExecutionPlan>,
+    right: &Arc<dyn ExecutionPlan>,
+    on: JoinOnRef,
+) -> Result<bool> {
+    let (Partitioning::Range(left_range), Partitioning::Range(right_range)) =
+        (left.output_partitioning(), right.output_partitioning())
+    else {
+        return Ok(false);
+    };
+
+    if left_range.partition_count() != right_range.partition_count() {
+        return Ok(false);
+    }
+
+    let Some(right_as_left) =
+        translate_right_range_to_left(right_range, on, right.equivalence_properties())
+    else {
+        return Ok(false);
+    };
+
+    Ok(left_range.compatible_with(&right_as_left, left.equivalence_properties()))
+}
+
+/// Returns the accepted pairwise partitioning mode currently satisfied by the
+/// two join inputs, if any.
+pub fn pairwise_partitioning_compatibility(
+    left: &Arc<dyn ExecutionPlan>,
+    right: &Arc<dyn ExecutionPlan>,
+    left_keys: &[PhysicalExprRef],
+    right_keys: &[PhysicalExprRef],
+    accepted: PartitioningCompatibilitySet,
+) -> Result<Option<PartitioningCompatibility>> {
+    if accepted.contains(PartitioningCompatibility::Hash) {
+        let left_partitioning = left.output_partitioning();
+        let right_partitioning = right.output_partitioning();
+        let partition_count = left_partitioning.partition_count();
+        let left_hash = Partitioning::Hash(left_keys.to_vec(), partition_count);
+        let right_hash = Partitioning::Hash(right_keys.to_vec(), partition_count);
+
+        if left_partitioning.partition_count() == right_partitioning.partition_count()
+            && left_partitioning
+                .compatible_with(&left_hash, left.equivalence_properties())
+            && right_partitioning
+                .compatible_with(&right_hash, right.equivalence_properties())
+        {
+            return Ok(Some(PartitioningCompatibility::Hash));
+        }
+    }
+
+    if accepted.contains(PartitioningCompatibility::Range) {
+        let on = left_keys
+            .iter()
+            .zip(right_keys)
+            .map(|(left, right)| (Arc::clone(left), Arc::clone(right)))
+            .collect::<Vec<_>>();
+        if range_partitioned_join_inputs_compatible(left, right, &on)? {
+            return Ok(Some(PartitioningCompatibility::Range));
+        }
+    }
+
+    Ok(None)
+}
+
+/// `compatible_with` compares partition maps in one expression space, so
+/// translate the right range key `r.b` through the join key to `l.a` before
+/// comparing it with the left range map.
+///
+/// Example:
+///
+/// ```text
+/// left:  Range([l.a], [(10), (20)])
+/// right: Range([r.b], [(10), (20)])
+/// join:  l.a = r.b
+/// ```
+fn translate_right_range_to_left(
+    right_range: &RangePartitioning,
+    on: JoinOnRef,
+    right_eq_properties: &EquivalenceProperties,
+) -> Option<RangePartitioning> {
+    let ordering = right_range
+        .ordering()
+        .iter()
+        .map(|right_sort_expr| {
+            on.iter()
+                .find(|(_, right_join_key)| {
+                    physical_exprs_equal_with_equivalence(
+                        &[Arc::clone(&right_sort_expr.expr)],
+                        &[Arc::clone(right_join_key)],
+                        right_eq_properties,
+                    )
+                })
+                .map(|(left_join_key, _)| {
+                    PhysicalSortExpr::new(
+                        Arc::clone(left_join_key),
+                        right_sort_expr.options,
+                    )
+                })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let ordering = LexOrdering::new(ordering)?;
+
+    Some(RangePartitioning::new(
+        ordering,
+        right_range.split_points().to_vec(),
+    ))
 }
 
 /// Calculate the output ordering of a given join operation.

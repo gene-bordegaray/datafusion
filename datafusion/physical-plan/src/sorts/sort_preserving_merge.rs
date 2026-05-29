@@ -265,8 +265,10 @@ impl ExecutionPlan for SortPreservingMergeExec {
             })
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::UnspecifiedDistribution]
+    fn input_distribution_requirement(&self) -> crate::InputDistributionRequirement {
+        crate::InputDistributionRequirement::Independent(vec![
+            Distribution::UnspecifiedDistribution,
+        ])
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {

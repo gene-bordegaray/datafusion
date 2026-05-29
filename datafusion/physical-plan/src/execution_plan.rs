@@ -34,7 +34,7 @@ pub use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
 pub use datafusion_expr::{Accumulator, ColumnarValue};
 pub use datafusion_physical_expr::window::WindowExpr;
 pub use datafusion_physical_expr::{
-    Distribution, Partitioning, PhysicalExpr, expressions,
+    Distribution, InputDistributionRequirement, Partitioning, PhysicalExpr, expressions,
 };
 
 use std::any::Any;
@@ -161,10 +161,28 @@ pub trait ExecutionPlan: Any + Debug + DisplayAs + Send + Sync {
         check_default_invariants(self, check)
     }
 
-    /// Specifies the data distribution requirements for all the
-    /// children for this `ExecutionPlan`, By default it's [[Distribution::UnspecifiedDistribution]] for each child,
+    /// Specifies per-child input distribution requirements for this
+    /// `ExecutionPlan`.
+    ///
+    /// This method represents each child independently. Use
+    /// [`Self::input_distribution_requirement`] instead.
+    ///
+    /// The default requirement for each child is
+    /// [`Distribution::UnspecifiedDistribution`].
+    #[deprecated(since = "53.1.0", note = "Use input_distribution_requirement instead")]
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![Distribution::UnspecifiedDistribution; self.children().len()]
+    }
+
+    /// Specifies input distribution requirements for this `ExecutionPlan`.
+    ///
+    /// Requirements can be independent per-child distributions or pairwise
+    /// relationships between child partitioning schemes.
+    fn input_distribution_requirement(&self) -> InputDistributionRequirement {
+        InputDistributionRequirement::Independent(vec![
+            Distribution::UnspecifiedDistribution;
+            self.children().len()
+        ])
     }
 
     /// Specifies the ordering required for all of the children of this
@@ -213,7 +231,8 @@ pub trait ExecutionPlan: Any + Debug + DisplayAs + Send + Sync {
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         // By default try to maximize parallelism with more CPUs if
         // possible
-        self.required_input_distribution()
+        self.input_distribution_requirement()
+            .per_child_distributions()
             .into_iter()
             .map(|dist| !matches!(dist, Distribution::SinglePartition))
             .collect()
@@ -1203,7 +1222,18 @@ pub fn check_default_invariants<P: ExecutionPlan + ?Sized>(
 
     check_len!(plan, maintains_input_order, children_len);
     check_len!(plan, required_input_ordering, children_len);
-    check_len!(plan, required_input_distribution, children_len);
+    let actual_len = plan
+        .input_distribution_requirement()
+        .per_child_distributions()
+        .len();
+    assert_eq_or_internal_err!(
+        actual_len,
+        children_len,
+        "{}::input_distribution_requirement returned Vec with incorrect size: {} != {}",
+        plan.name(),
+        actual_len,
+        children_len
+    );
     check_len!(plan, benefits_from_input_partitioning, children_len);
 
     Ok(())

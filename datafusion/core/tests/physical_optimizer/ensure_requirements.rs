@@ -47,7 +47,7 @@ use datafusion_physical_optimizer::output_requirements::OutputRequirementExec;
 use datafusion_physical_optimizer::sanity_checker::SanityCheckPlan;
 
 use datafusion_common::{JoinType, NullEquality};
-use datafusion_physical_expr::Distribution;
+use datafusion_physical_expr::{Distribution, InputDistributionRequirement};
 use datafusion_physical_expr_common::sort_expr::OrderingRequirements;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
@@ -965,8 +965,8 @@ impl ExecutionPlan for MockReqExec {
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![self.dist.clone()]
+    fn input_distribution_requirement(&self) -> InputDistributionRequirement {
+        InputDistributionRequirement::Independent(vec![self.dist.clone()])
     }
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         vec![

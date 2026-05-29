@@ -26,7 +26,9 @@ use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::{Result, assert_eq_or_internal_err};
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::{Distribution, EquivalenceProperties};
+use datafusion_physical_expr::{
+    Distribution, EquivalenceProperties, InputDistributionRequirement,
+};
 use datafusion_physical_expr_common::sort_expr::{LexRequirement, OrderingRequirements};
 use datafusion_physical_plan::metrics::MetricsSet;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -188,10 +190,13 @@ impl ExecutionPlan for DataSinkExec {
         vec![false]
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
+    fn input_distribution_requirement(&self) -> InputDistributionRequirement {
         // DataSink is responsible for dynamically partitioning its
         // own input at execution time, and so requires a single input partition.
-        vec![Distribution::SinglePartition; self.children().len()]
+        InputDistributionRequirement::Independent(vec![
+            Distribution::SinglePartition;
+            self.children().len()
+        ])
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {

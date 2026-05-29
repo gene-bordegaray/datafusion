@@ -161,8 +161,10 @@ impl ExecutionPlan for GlobalLimitExec {
         vec![&self.input]
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+    fn input_distribution_requirement(&self) -> crate::InputDistributionRequirement {
+        crate::InputDistributionRequirement::Independent(vec![
+            Distribution::SinglePartition,
+        ])
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {

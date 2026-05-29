@@ -252,8 +252,10 @@ impl ExecutionPlan for UnnestExec {
         )?))
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::UnspecifiedDistribution]
+    fn input_distribution_requirement(&self) -> crate::InputDistributionRequirement {
+        crate::InputDistributionRequirement::Independent(vec![
+            Distribution::UnspecifiedDistribution,
+        ])
     }
 
     fn execute(

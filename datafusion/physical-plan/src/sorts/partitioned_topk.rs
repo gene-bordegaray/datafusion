@@ -301,13 +301,15 @@ impl ExecutionPlan for PartitionedTopKExec {
         &self.cache
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
+    fn input_distribution_requirement(&self) -> crate::InputDistributionRequirement {
         let partition_exprs: Vec<Arc<dyn PhysicalExpr>> = self.expr
             [..self.partition_prefix_len]
             .iter()
             .map(|e| Arc::clone(&e.expr))
             .collect();
-        vec![Distribution::HashPartitioned(partition_exprs)]
+        crate::InputDistributionRequirement::Independent(vec![
+            Distribution::HashPartitioned(partition_exprs),
+        ])
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
