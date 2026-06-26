@@ -674,6 +674,11 @@ impl TestConfig {
         self
     }
 
+    fn with_preserve_file_partitions(mut self, threshold: usize) -> Self {
+        self.config.optimizer.preserve_file_partitions = threshold;
+        self
+    }
+
     /// Perform a series of runs using the current [`TestConfig`],
     /// assert the expected plan result,
     /// and return the result plan (for potential subsequent runs).
@@ -757,6 +762,260 @@ fn partitioned_join_plan(
         Arc::new(Column::new_with_schema("b", &right.schema()).unwrap()) as _,
     )];
     hash_join_exec(left, right, &join_on, &join_type)
+}
+
+#[test]
+fn partitioned_aggregate_modes_require_key_partitioning() -> Result<()> {
+    for mode in [
+        AggregateMode::FinalPartitioned,
+        AggregateMode::SinglePartitioned,
+    ] {
+        let input = parquet_exec();
+        let input_schema = input.schema();
+        let aggregate = AggregateExec::try_new(
+            mode,
+            PhysicalGroupBy::new_single(vec![(
+                col("a", &input_schema)?,
+                "a".to_string(),
+            )]),
+            vec![],
+            vec![],
+            input,
+            input_schema,
+        )?;
+        let requirements = aggregate.required_input_distribution();
+        assert_eq!(requirements.len(), 1);
+        let Distribution::KeyPartitioned(exprs) = &requirements[0] else {
+            panic!("expected KeyPartitioned, got {:?}", requirements[0]);
+        };
+        assert_eq!(exprs.len(), 1);
+        assert_eq!(exprs[0].to_string(), "a@0");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn range_aggregate_keeps_range_partitioning() -> Result<()> {
+    let input = parquet_exec_with_output_partitioning(range_partitioning(
+        "a",
+        [10, 20, 30],
+        SortOptions::default(),
+    )?);
+    let aggregate =
+        aggregate_exec_with_alias(input, vec![("a".to_string(), "a".to_string())]);
+
+    let plan = TestConfig::default()
+        .with_query_execution_partitions(4)
+        .to_plan(aggregate, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    AggregateExec: mode=FinalPartitioned, gby=[a@0 as a], aggr=[]
+      AggregateExec: mode=Partial, gby=[a@0 as a], aggr=[]
+        DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn range_aggregate_accepts_subset_partitioning() -> Result<()> {
+    let input = parquet_exec_with_output_partitioning(range_partitioning(
+        "a",
+        [10, 20, 30],
+        SortOptions::default(),
+    )?);
+    let aggregate = aggregate_exec_with_alias(
+        input,
+        vec![
+            ("a".to_string(), "a".to_string()),
+            ("b".to_string(), "b".to_string()),
+        ],
+    );
+
+    let plan = TestConfig::default()
+        .with_query_execution_partitions(4)
+        .to_plan(aggregate, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    AggregateExec: mode=FinalPartitioned, gby=[a@0 as a, b@1 as b], aggr=[]
+      AggregateExec: mode=Partial, gby=[a@0 as a, b@1 as b], aggr=[]
+        DataSourceExec: file_groups={4 groups: [[p0], [p1], [p2], [p3]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20), (30)], 4), file_type=parquet
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn range_aggregate_rehashes_below_subset_threshold() -> Result<()> {
+    let input = parquet_exec_with_output_partitioning(range_partitioning(
+        "a",
+        [10, 20],
+        SortOptions::default(),
+    )?);
+    let aggregate =
+        aggregate_exec_with_alias(input, vec![("a".to_string(), "a".to_string())]);
+
+    let plan = TestConfig::default()
+        .with_query_execution_partitions(4)
+        .to_plan(aggregate, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    AggregateExec: mode=FinalPartitioned, gby=[a@0 as a], aggr=[]
+      RepartitionExec: partitioning=Hash([a@0], 4), input_partitions=4
+        AggregateExec: mode=Partial, gby=[a@0 as a], aggr=[]
+          RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=3
+            DataSourceExec: file_groups={3 groups: [[p0], [p1], [p2]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20)], 3), file_type=parquet
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn range_aggregate_preserves_file_partitions_below_target() -> Result<()> {
+    let input = parquet_exec_with_output_partitioning(range_partitioning(
+        "a",
+        [10, 20],
+        SortOptions::default(),
+    )?);
+    let aggregate =
+        aggregate_exec_with_alias(input, vec![("a".to_string(), "a".to_string())]);
+
+    let plan = TestConfig::default()
+        .with_query_execution_partitions(4)
+        .with_preserve_file_partitions(1)
+        .to_plan(aggregate, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    AggregateExec: mode=FinalPartitioned, gby=[a@0 as a], aggr=[]
+      AggregateExec: mode=Partial, gby=[a@0 as a], aggr=[]
+        DataSourceExec: file_groups={3 groups: [[p0], [p1], [p2]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20)], 3), file_type=parquet
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn range_aggregate_rehashes_when_file_partitions_below_preserve_threshold() -> Result<()>
+{
+    let input = parquet_exec_with_output_partitioning(range_partitioning(
+        "a",
+        [10, 20],
+        SortOptions::default(),
+    )?);
+    let aggregate =
+        aggregate_exec_with_alias(input, vec![("a".to_string(), "a".to_string())]);
+
+    let plan = TestConfig::default()
+        .with_query_execution_partitions(4)
+        .with_preserve_file_partitions(4)
+        .to_plan(aggregate, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    AggregateExec: mode=FinalPartitioned, gby=[a@0 as a], aggr=[]
+      RepartitionExec: partitioning=Hash([a@0], 4), input_partitions=4
+        AggregateExec: mode=Partial, gby=[a@0 as a], aggr=[]
+          RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=3
+            DataSourceExec: file_groups={3 groups: [[p0], [p1], [p2]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20)], 3), file_type=parquet
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn range_aggregate_rehashes_incompatible_partitioning() -> Result<()> {
+    let input = parquet_exec_with_output_partitioning(range_partitioning(
+        "a",
+        [10, 20],
+        SortOptions::default(),
+    )?);
+    let aggregate =
+        aggregate_exec_with_alias(input, vec![("b".to_string(), "b".to_string())]);
+
+    let plan = TestConfig::default()
+        .with_query_execution_partitions(3)
+        .to_plan(aggregate, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    AggregateExec: mode=FinalPartitioned, gby=[b@0 as b], aggr=[]
+      RepartitionExec: partitioning=Hash([b@0], 3), input_partitions=3
+        AggregateExec: mode=Partial, gby=[b@1 as b], aggr=[]
+          DataSourceExec: file_groups={3 groups: [[p0], [p1], [p2]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20)], 3), file_type=parquet
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn grouping_set_range_aggregate_rehashes_with_grouping_id() -> Result<()> {
+    let input = parquet_exec_with_output_partitioning(range_partitioning(
+        "a",
+        [10, 20],
+        SortOptions::default(),
+    )?);
+    let input_schema = input.schema();
+    let group_by = PhysicalGroupBy::new(
+        vec![
+            (col("a", &input_schema)?, "a".to_string()),
+            (col("b", &input_schema)?, "b".to_string()),
+        ],
+        vec![
+            (lit(ScalarValue::Int64(None)), "a".to_string()),
+            (lit(ScalarValue::Int64(None)), "b".to_string()),
+        ],
+        vec![vec![false, true], vec![false, false]],
+        true,
+    );
+    let partial = Arc::new(AggregateExec::try_new(
+        AggregateMode::Partial,
+        group_by.clone(),
+        vec![],
+        vec![],
+        input,
+        Arc::clone(&input_schema),
+    )?);
+    let aggregate = Arc::new(AggregateExec::try_new(
+        AggregateMode::FinalPartitioned,
+        group_by.as_final(),
+        vec![],
+        vec![],
+        Arc::clone(&partial) as _,
+        partial.schema(),
+    )?);
+
+    let plan = TestConfig::default()
+        .with_query_execution_partitions(3)
+        .to_plan(aggregate, &DISTRIB_DISTRIB_SORT);
+
+    assert_plan!(
+        plan,
+        @r"
+    AggregateExec: mode=FinalPartitioned, gby=[a@0 as a, b@1 as b, __grouping_id@2 as __grouping_id], aggr=[]
+      RepartitionExec: partitioning=Hash([a@0, b@1, __grouping_id@2], 3), input_partitions=3
+        AggregateExec: mode=Partial, gby=[(a@0 as a, NULL as b), (a@0 as a, b@1 as b)], aggr=[]
+          DataSourceExec: file_groups={3 groups: [[p0], [p1], [p2]]}, projection=[a, b, c, d, e], output_partitioning=Range([a@0 ASC], [(10), (20)], 3), file_type=parquet
+    "
+    );
+
+    Ok(())
 }
 
 #[test]

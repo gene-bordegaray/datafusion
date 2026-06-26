@@ -29,18 +29,16 @@ set datafusion.explain.physical_plan_only = true;
 ##########
 # TEST 1: Aggregate on Range Partition Column
 # Scanning range_key preserves source Range partitioning metadata.
-# Planning still inserts Hash repartitioning today; later optimizer PRs can
-# use this baseline to show when the repartition is removed.
+# Planning does not need Hash repartitioning because Range partitioning
+# colocates rows with equal range_key values.
 ##########
 
 query TT
 EXPLAIN SELECT range_key, SUM(value) FROM range_partitioned GROUP BY range_key;
 ----
 physical_plan
-01)AggregateExec: mode=FinalPartitioned, gby=[range_key@0 as range_key], aggr=[sum(range_partitioned.value)]
-02)--RepartitionExec: partitioning=Hash([range_key@0], 4), input_partitions=4
-03)----AggregateExec: mode=Partial, gby=[range_key@0 as range_key], aggr=[sum(range_partitioned.value)]
-04)------DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-0.csv], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-1.csv], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-2.csv], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-3.csv]]}, projection=[range_key, value], output_partitioning=Range([range_key@0 ASC], [(10), (20), (30)], 4), file_type=csv, has_header=false
+01)AggregateExec: mode=SinglePartitioned, gby=[range_key@0 as range_key], aggr=[sum(range_partitioned.value)]
+02)--DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-0.csv], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-1.csv], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-2.csv], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-3.csv]]}, projection=[range_key, value], output_partitioning=Range([range_key@0 ASC], [(10), (20), (30)], 4), file_type=csv, has_header=false
 
 query II
 SELECT range_key, SUM(value) FROM range_partitioned GROUP BY range_key ORDER BY range_key;
@@ -56,7 +54,33 @@ SELECT range_key, SUM(value) FROM range_partitioned GROUP BY range_key ORDER BY 
 
 
 ##########
-# TEST 2: Aggregate on Non-Range Column
+# TEST 2: Aggregate on Range Partition Column and Additional Grouping Column
+# Range partitioning by range_key is enough to colocate rows grouped by
+# (range_key, non_range_key), because equal groups also have equal range_key.
+##########
+
+query TT
+EXPLAIN SELECT range_key, non_range_key, SUM(value) FROM range_partitioned GROUP BY range_key, non_range_key;
+----
+physical_plan
+01)AggregateExec: mode=SinglePartitioned, gby=[range_key@0 as range_key, non_range_key@1 as non_range_key], aggr=[sum(range_partitioned.value)]
+02)--DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-0.csv], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-1.csv], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-2.csv], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-3.csv]]}, projection=[range_key, non_range_key, value], output_partitioning=Range([range_key@0 ASC], [(10), (20), (30)], 4), file_type=csv, has_header=false
+
+query III
+SELECT range_key, non_range_key, SUM(value) FROM range_partitioned GROUP BY range_key, non_range_key ORDER BY range_key, non_range_key;
+----
+1 1 10
+5 2 50
+10 1 100
+15 2 150
+20 1 200
+25 2 250
+30 1 300
+35 2 350
+
+
+##########
+# TEST 3: Aggregate on Non-Range Column
 # Projecting away range_key means the scan output no longer contains the
 # expression needed to describe range partitioning, so it reports
 # UnknownPartitioning with the same partition count.
@@ -79,7 +103,7 @@ SELECT non_range_key, SUM(value) FROM range_partitioned GROUP BY non_range_key O
 
 
 ##########
-# TEST 3: Range Join Avoids Hash Repartition
+# TEST 4: Range Join Avoids Hash Repartition
 # Both inputs expose compatible Range partitioning on range_key. Planning can
 # satisfy the partitioned join without inserting Hash repartitioning.
 ##########
@@ -110,7 +134,7 @@ ORDER BY l.range_key;
 35 350 350
 
 ##########
-# TEST 3b: Non-Range Join Repartitions
+# TEST 4b: Non-Range Join Repartitions
 # The source Range partitioning does not satisfy a join on non_range_key, so
 # planning still inserts Hash repartitioning.
 ##########
@@ -128,7 +152,7 @@ physical_plan
 05)----DataSourceExec: file_groups={4 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-0.csv], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-1.csv], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-2.csv], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_partitioned/part-3.csv]]}, projection=[non_range_key, value], output_partitioning=UnknownPartitioning(4), file_type=csv, has_header=false
 
 ##########
-# TEST 4: Union of Range Partitioned Inputs
+# TEST 5: Union of Range Partitioned Inputs
 # Each input exposes Range partitioning on range_key. This records current
 # UNION ALL behavior before later PRs decide whether compatible range inputs can
 # preserve Range partitioning across the union.
