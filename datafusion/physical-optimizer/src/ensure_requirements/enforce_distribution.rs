@@ -1001,6 +1001,35 @@ fn requirement_includes_grouping_id(requirement: &Distribution) -> bool {
     })
 }
 
+fn partial_aggregate_preserves_reusable_key_partitioning(
+    plan: &Arc<dyn ExecutionPlan>,
+    child: &Arc<dyn ExecutionPlan>,
+    allow_subset: bool,
+) -> bool {
+    let Some(aggregate) = plan.downcast_ref::<AggregateExec>() else {
+        return false;
+    };
+    if aggregate.mode() != &AggregateMode::Partial
+        || aggregate.group_expr().is_true_no_grouping()
+        || aggregate.group_expr().has_grouping_set()
+    {
+        return false;
+    }
+
+    let required = Distribution::KeyPartitioned(
+        aggregate
+            .group_expr()
+            .expr()
+            .iter()
+            .map(|(expr, _)| Arc::clone(expr))
+            .collect(),
+    );
+    child
+        .output_partitioning()
+        .satisfaction(&required, child.equivalence_properties(), allow_subset)
+        .is_satisfied()
+}
+
 /// Calculates the `RepartitionRequirementStatus` for each children to generate
 /// consistent and sensible (in terms of performance) distribution requirements.
 /// As an example, a hash join's left (build) child might produce
@@ -1281,21 +1310,14 @@ pub fn ensure_distribution(
                 force_hash_to_target,
             },
         )| {
-            let increases_partition_count =
-                child.plan.output_partitioning().partition_count() < target_partitions;
-
-            let add_roundrobin = enable_round_robin
-                // Operator benefits from partitioning (e.g. filter):
-                && roundrobin_beneficial
-                && roundrobin_beneficial_stats
-                // Unless partitioning increases the partition count, it is not beneficial:
-                && increases_partition_count;
-
             // Allow subset satisfaction when:
             // 1. Current partition count >= threshold
             // 2. Not a partitioned join since must use exact hash matching for joins
             // 3. Not a grouping set aggregate (requires exact hash including __grouping_id)
             let current_partitions = child.plan.output_partitioning().partition_count();
+
+            let preserve_file_partitions = config.optimizer.preserve_file_partitions > 0
+                && current_partitions >= config.optimizer.preserve_file_partitions;
 
             let allow_subset_satisfy_partitioning = (current_partitions
                 >= subset_satisfaction_threshold
@@ -1303,10 +1325,31 @@ pub fn ensure_distribution(
                 // partitioning to the optimizer. Respect it when the only
                 // reason to repartition would be to increase partition count
                 // beyond the preserved file-group count.
-                || (config.optimizer.preserve_file_partitions > 0
-                    && current_partitions < target_partitions))
+                || (preserve_file_partitions && current_partitions < target_partitions))
                 && !is_partitioned_join
                 && !requirement_includes_grouping_id(&requirement);
+
+            // A Partial aggregate has no required input distribution, so the
+            // generic parallelism rule can add RoundRobin below it. Avoid doing
+            // that when the child already has key partitioning that the
+            // following FinalPartitioned aggregate can reuse.
+            let preserve_reusable_key_partitioning_through_partial =
+                allow_subset_satisfy_partitioning
+                    && partial_aggregate_preserves_reusable_key_partitioning(
+                        &plan,
+                        &child.plan,
+                        allow_subset_satisfy_partitioning,
+                    );
+
+            let increases_partition_count = current_partitions < target_partitions;
+
+            let add_roundrobin = enable_round_robin
+                // Operator benefits from partitioning (e.g. filter):
+                && roundrobin_beneficial
+                && roundrobin_beneficial_stats
+                // Unless partitioning increases the partition count, it is not beneficial:
+                && increases_partition_count
+                && !preserve_reusable_key_partitioning_through_partial;
 
             // When `repartition_file_scans` is set, attempt to increase
             // parallelism at the source.
@@ -1316,6 +1359,7 @@ pub fn ensure_distribution(
             // specific physical plan nodes, such as certain datasources, which are repartitioned.
             if repartition_file_scans
                 && roundrobin_beneficial_stats
+                && !preserve_reusable_key_partitioning_through_partial
                 && let Some(new_child) =
                     child.plan.repartitioned(target_partitions, config)?
             {
@@ -1327,11 +1371,36 @@ pub fn ensure_distribution(
                 Distribution::SinglePartition => {
                     child = add_merge_on_top(child, removed_fetch);
                 }
-                Distribution::HashPartitioned(exprs)
-                | Distribution::KeyPartitioned(exprs) => {
+                Distribution::HashPartitioned(exprs) => {
                     // See https://github.com/apache/datafusion/issues/18341#issuecomment-3503238325 for background
                     // When inserting hash is necessary to satisfy hash requirement, insert hash repartition.
                     if hash_necessary {
+                        child = add_hash_on_top(
+                            child,
+                            exprs.to_vec(),
+                            target_partitions,
+                            allow_subset_satisfy_partitioning,
+                            force_hash_to_target,
+                        )?;
+                    }
+                }
+                Distribution::KeyPartitioned(exprs) => {
+                    let can_reuse_satisfied_key_partitioning =
+                        allow_subset_satisfy_partitioning
+                            && child
+                                .plan
+                                .output_partitioning()
+                                .satisfaction(
+                                    &requirement,
+                                    child.plan.equivalence_properties(),
+                                    allow_subset_satisfy_partitioning,
+                                )
+                                .is_satisfied();
+
+                    // See https://github.com/apache/datafusion/issues/18341#issuecomment-3503238325 for background
+                    // When inserting hash is necessary to satisfy key colocation,
+                    // fall back to hash repartitioning.
+                    if hash_necessary && !can_reuse_satisfied_key_partitioning {
                         child = add_hash_on_top(
                             child,
                             exprs.to_vec(),
