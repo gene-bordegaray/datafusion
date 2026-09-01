@@ -518,6 +518,63 @@ from table_with_metadata limit 1;
 ----
 NULL the id field
 
+# Regression tests for https://github.com/apache/datafusion/issues/24721:
+# field metadata must survive the physical projection optimizations
+# (projection removal, projection collapsing, projection/child swapping).
+
+statement ok
+CREATE TABLE plain_tbl AS SELECT 1::INT AS id, 'x' AS name;
+
+# metadata survives nested identity re-selects
+query T rowsort
+SELECT arrow_metadata(id, 'metadata_key') FROM (SELECT id FROM (SELECT id FROM table_with_metadata) x) y;
+----
+the id field
+the id field
+the id field
+
+# metadata survives a union with a source that has none
+query T rowsort
+SELECT arrow_metadata(id, 'metadata_key') FROM (
+  SELECT id FROM table_with_metadata UNION ALL SELECT id FROM plain_tbl
+) t;
+----
+the id field
+the id field
+the id field
+the id field
+
+# metadata survives a join with a source that has none
+query T rowsort
+SELECT arrow_metadata(a.id, 'metadata_key') FROM table_with_metadata a JOIN plain_tbl b ON a.id = b.id;
+----
+the id field
+
+# metadata survives sort + limit
+query T
+SELECT arrow_metadata(x, 'metadata_key') FROM (SELECT id AS x FROM table_with_metadata ORDER BY id LIMIT 2) s;
+----
+the id field
+the id field
+
+# metadata survives a filter under an alias
+query T rowsort
+SELECT arrow_metadata(nm, 'metadata_key') FROM (SELECT name AS nm FROM table_with_metadata WHERE id IS NOT NULL) s;
+----
+the name field
+the name field
+
+# metadata survives a distinct
+query T rowsort
+SELECT arrow_metadata(id, 'metadata_key') FROM (SELECT DISTINCT id FROM table_with_metadata) s;
+----
+the id field
+the id field
+the id field
+
+statement ok
+DROP TABLE plain_tbl;
+
 statement ok
 drop table table_with_metadata;
 

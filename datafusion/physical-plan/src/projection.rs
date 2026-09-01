@@ -1720,6 +1720,95 @@ mod tests {
         Ok(())
     }
 
+    /// A projection whose output metadata is not derivable from its expressions
+    /// and input is left completely alone by [`remove_unnecessary_projections`]:
+    /// the `overrides_metadata` guard returns before
+    /// [`ExecutionPlan::try_swapping_with_projection`] is consulted, so the
+    /// projection is neither removed *nor pushed under its child*.
+    ///
+    /// This is more conservative than correctness strictly requires. The swap
+    /// targets that route through [`make_with_child`] (`CoalescePartitionsExec`,
+    /// `FilterExec`, `RepartitionExec`, `SortExec`, `SortPreservingMergeExec`,
+    /// `UnionExec`, `OutputRequirementExec`) all preserve the projection's output
+    /// metadata, so pushing under them would be safe. The path that genuinely
+    /// drops metadata is absorption into a data source, which rebuilds its
+    /// projected schema from the *source* schema.
+    ///
+    /// This test pins the current behavior so that any future narrowing of the
+    /// guard shows up as a deliberate change here rather than silently.
+    #[test]
+    fn test_metadata_projection_is_not_pushed_under_child() -> Result<()> {
+        use crate::coalesce_partitions::CoalescePartitionsExec;
+
+        // Widen the single-column scan to two columns so the projection below
+        // narrows the schema, which is what the swap implementations require.
+        let widened: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+            [
+                ProjectionExpr {
+                    expr: Arc::new(Column::new("i", 0)),
+                    alias: "i".to_string(),
+                },
+                ProjectionExpr {
+                    expr: Arc::new(Column::new("i", 0)),
+                    alias: "j".to_string(),
+                },
+            ],
+            test::scan_partitioned(2),
+        )?);
+        let coalesce: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalescePartitionsExec::new(widened));
+
+        let metadata_schema =
+            Schema::new(vec![Field::new("i", DataType::Int32, true).with_metadata(
+                HashMap::from([("event_field".to_string(), "true".to_string())]),
+            )]);
+        let projection: Arc<dyn ExecutionPlan> =
+            Arc::new(ProjectionExec::try_new_with_schema_metadata(
+                [ProjectionExpr {
+                    expr: Arc::new(Column::new("i", 0)),
+                    alias: "i".to_string(),
+                }],
+                coalesce,
+                &metadata_schema,
+            )?);
+        let expected_schema = projection.schema();
+
+        let optimized = remove_unnecessary_projections(Arc::clone(&projection))?;
+
+        // Not pushed under the `CoalescePartitionsExec`...
+        assert!(!optimized.transformed);
+        assert!(optimized.data.downcast_ref::<ProjectionExec>().is_some());
+        // ...but the metadata is intact, which is the property that matters.
+        assert_eq!(optimized.data.schema(), expected_schema);
+        Ok(())
+    }
+
+    /// `make_with_child` preserves output metadata, so the pushdown blocked by
+    /// [`test_metadata_projection_is_not_pushed_under_child`] would in fact be
+    /// metadata-safe: rebuilding the projection over the coalesce's own child
+    /// keeps the metadata that the guard is protecting.
+    #[test]
+    fn test_make_with_child_would_keep_metadata_under_coalesce() -> Result<()> {
+        use crate::coalesce_partitions::CoalescePartitionsExec;
+
+        let scan = test::scan_partitioned(2);
+        let coalesce: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalescePartitionsExec::new(Arc::clone(&scan)));
+        let projection = identity_projection_with_metadata(
+            coalesce,
+            HashMap::from([("event_field".to_string(), "true".to_string())]),
+            HashMap::new(),
+        )?;
+        let projection = projection
+            .downcast_ref::<ProjectionExec>()
+            .expect("test plan should be a ProjectionExec");
+
+        let rebuilt = make_with_child(projection, &scan)?;
+
+        assert_eq!(rebuilt.schema(), projection.schema());
+        Ok(())
+    }
+
     #[test]
     fn test_collect_column_indices() -> Result<()> {
         let expr = Arc::new(BinaryExpr::new(

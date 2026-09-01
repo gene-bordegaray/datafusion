@@ -97,3 +97,78 @@ FROM (
 );
 ----
 00010203040506070809000102030506 NULL
+
+##########
+## Regression tests for https://github.com/apache/datafusion/issues/24721
+##
+## Extension metadata is introduced by a projection (the CAST), not by the
+## source, so these exercise metadata surviving the physical projection
+## optimizations: projection removal, projection collapsing, and swapping a
+## projection with its child.
+##########
+
+statement ok
+CREATE TABLE uuid_src AS
+SELECT arrow_cast(X'00010203040506070809000102030506', 'FixedSizeBinary(16)') AS raw;
+
+# metadata survives an identity re-select above the projection that added it
+query T
+SELECT arrow_metadata(u, 'ARROW:extension:name') FROM (
+  SELECT u FROM (SELECT CAST(raw AS UUID) AS u FROM uuid_src)
+);
+----
+arrow.uuid
+
+# ... and two levels of identity re-select
+query T
+SELECT arrow_metadata(u, 'ARROW:extension:name') FROM (
+  SELECT u FROM (SELECT u FROM (SELECT CAST(raw AS UUID) AS u FROM uuid_src))
+);
+----
+arrow.uuid
+
+# metadata survives a sort between the projection and the reader
+query T
+SELECT arrow_metadata(u, 'ARROW:extension:name') FROM (
+  SELECT CAST(raw AS UUID) AS u FROM uuid_src ORDER BY raw
+);
+----
+arrow.uuid
+
+# metadata survives a limit
+query T
+SELECT arrow_metadata(u, 'ARROW:extension:name') FROM (
+  SELECT CAST(raw AS UUID) AS u FROM uuid_src LIMIT 1
+);
+----
+arrow.uuid
+
+# metadata survives a filter
+query T
+SELECT arrow_metadata(u, 'ARROW:extension:name') FROM (
+  SELECT CAST(raw AS UUID) AS u FROM uuid_src
+) WHERE u IS NOT NULL;
+----
+arrow.uuid
+
+# metadata survives a union
+query T rowsort
+SELECT arrow_metadata(u, 'ARROW:extension:name') FROM (
+  SELECT CAST(raw AS UUID) AS u FROM uuid_src
+  UNION ALL
+  SELECT CAST(raw AS UUID) AS u FROM uuid_src
+);
+----
+arrow.uuid
+arrow.uuid
+
+# metadata survives a join
+query T
+SELECT arrow_metadata(a.u, 'ARROW:extension:name') FROM
+  (SELECT CAST(raw AS UUID) AS u FROM uuid_src) a
+  JOIN (SELECT raw FROM uuid_src) b ON a.u = CAST(b.raw AS UUID);
+----
+arrow.uuid
+
+statement ok
+DROP TABLE uuid_src;
